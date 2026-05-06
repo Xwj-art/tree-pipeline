@@ -74,9 +74,11 @@ class DashboardGenerator:
             batch_lines.append(f"- Batch {idx}: " + ", ".join(batch))
         batches_section = "\n".join(batch_lines) if batch_lines else "- (no batches)"
 
+        # Module-level tasks only (exclude sub-tasks)
+        modules = [t for t in latest.values() if not t.is_sub_task]
+        modules.sort(key=lambda t: t.module)
         rows: List[str] = []
-        for module in sorted(latest.keys()):
-            task = latest[module]
+        for task in modules:
             deps = ", ".join(task.depends_on) if task.depends_on else "-"
             blocked = task.meta.get("blocked")
             if blocked:
@@ -84,11 +86,37 @@ class DashboardGenerator:
                 blocked_str = f"BLOCKED: {reason}"
             else:
                 blocked_str = "-"
+            subs = self.ledger.sub_tasks(task.module)
+            sub_done = sum(1 for s in subs if s.status == "done")
+            sub_info = f" ({sub_done}/{len(subs)} files)" if subs else ""
             rows.append(
-                f"| {task.module} | {task.status} | {deps} | {blocked_str} | {task.updated_at} |"
+                f"| {task.module}{sub_info} | {task.status} | {deps} | {blocked_str} | {task.updated_at} |"
             )
         task_rows = "\n".join(rows) if rows else "| - | - | - | - | - |"
 
+        # File Worker tables
+        sub_sections: List[str] = []
+        for task in modules:
+            subs = self.ledger.sub_tasks(task.module)
+            if not subs:
+                continue
+            sub_rows: List[str] = []
+            for s in sorted(subs, key=lambda x: x.id):
+                blocked = s.meta.get("blocked")
+                blocked_str = "BLOCKED" if blocked else "-"
+                sub_rows.append(
+                    f"| {s.id} | {s.title} | {s.status} | {blocked_str} |"
+                )
+            sub_table = (
+                f"### {task.module}\n\n"
+                "| File | Description | Status | Blocked |\n"
+                "|---|---|---|---|\n"
+                + "\n".join(sub_rows)
+            )
+            sub_sections.append(sub_table)
+        file_workers_section = "\n\n".join(sub_sections) if sub_sections else "- (no file workers dispatched)"
+
+        # Next actions: module-level
         ready = self.ledger.ready_tasks()
         if ready:
             next_lines: List[str] = []
@@ -104,22 +132,36 @@ class DashboardGenerator:
         else:
             next_actions = "- No ready tasks. Validate dependencies or check for cycles."
 
+        # Next actions: sub-task level
+        sub_ready_lines: List[str] = []
+        for task in modules:
+            ready_subs = self.ledger.ready_sub_tasks(task.module)
+            if ready_subs:
+                sub_ready_lines.append(f"- **{task.module}** file workers ready:")
+                for s in ready_subs[:5]:
+                    sub_ready_lines.append(f"  - Dispatch `{s.title}` ({s.id})")
+        sub_next = "\n".join(sub_ready_lines) if sub_ready_lines else "- (no file workers ready)"
+
         md = (
             f"# Tree Pipeline Dashboard - {run_id}\n\n"
             f"Generated at: {utc_now_human()}\n\n"
             "## Summary\n\n"
-            f"- Total tasks: {stats.total}\n"
+            f"- Total module tasks: {stats.total}\n"
             f"- Done: {stats.done}\n"
             f"- In progress: {stats.in_progress}\n"
             f"- Blocked: {stats.blocked}\n\n"
             "## Batches\n\n"
             f"{batches_section}\n\n"
-            "## Task Table\n\n"
+            "## Modules\n\n"
             "| Module | Status | Depends On | Blocked | Updated |\n"
             "|---|---|---|---|---|\n"
             f"{task_rows}\n\n"
-            "## Next Actions\n\n"
-            f"{next_actions}\n"
+            "## File Workers\n\n"
+            f"{file_workers_section}\n\n"
+            "## Next Actions (Modules)\n\n"
+            f"{next_actions}\n\n"
+            "## Next Actions (File Workers)\n\n"
+            f"{sub_next}\n"
         )
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)

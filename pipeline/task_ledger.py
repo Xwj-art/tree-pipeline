@@ -68,7 +68,11 @@ def utc_now_iso() -> str:
 
 @dataclass(slots=True)
 class TaskEntry:
-    """A single task entry."""
+    """A single task entry.
+
+    Module-level tasks: `id` is the module name, `parent_id` is None.
+    File-level sub-tasks: `id` is the file path, `parent_id` is the module name.
+    """
 
     id: str
     module: str
@@ -78,23 +82,29 @@ class TaskEntry:
     created_at: str
     updated_at: str
     meta: Dict[str, object]
+    parent_id: Optional[str] = None
+
+    @property
+    def is_sub_task(self) -> bool:
+        """Whether this is a file-level sub-task."""
+        return self.parent_id is not None
 
     def to_json(self) -> str:
         """Serialize task to a JSON string."""
 
-        return json.dumps(
-            {
-                "id": self.id,
-                "module": self.module,
-                "title": self.title,
-                "status": self.status,
-                "depends_on": self.depends_on,
-                "created_at": self.created_at,
-                "updated_at": self.updated_at,
-                "meta": self.meta,
-            },
-            ensure_ascii=False,
-        )
+        d: Dict[str, object] = {
+            "id": self.id,
+            "module": self.module,
+            "title": self.title,
+            "status": self.status,
+            "depends_on": self.depends_on,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "meta": self.meta,
+        }
+        if self.parent_id:
+            d["parent_id"] = self.parent_id
+        return json.dumps(d, ensure_ascii=False)
 
     @staticmethod
     def from_dict(data: Dict[str, object]) -> "TaskEntry":
@@ -110,6 +120,7 @@ class TaskEntry:
         meta_raw = data.get("meta", {})
         meta = dict(meta_raw) if isinstance(meta_raw, dict) else {}
 
+        parent_id = data.get("parent_id")
         return TaskEntry(
             id=str(data["id"]),
             module=str(data["module"]),
@@ -119,6 +130,7 @@ class TaskEntry:
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
             meta=meta,
+            parent_id=str(parent_id) if parent_id else None,
         )
 
 
@@ -315,12 +327,92 @@ class TaskLedger:
         self.append(updated)
         return updated
 
+    # ── Sub-task (file-level) operations ──────────────────────────────
+
+    def create_sub_tasks(
+        self,
+        *,
+        module: str,
+        files: List[Dict[str, object]],
+    ) -> List[TaskEntry]:
+        """Create file-level sub-tasks for a module.
+
+        Each file dict: {id, title, depends_on: [file_ids]}.
+        Sub-tasks use a simplified state model: pending → coding → done.
+        """
+
+        now = utc_now_iso()
+        created: List[TaskEntry] = []
+        for f in files:
+            file_id = str(f["id"])
+            task_id = f"{module}::{file_id}"
+            deps_raw = f.get("depends_on", [])
+            if isinstance(deps_raw, list):
+                full_deps = [f"{module}::{str(d)}" for d in deps_raw]
+            else:
+                full_deps = []
+            entry = TaskEntry(
+                id=task_id,
+                module=module,
+                title=str(f.get("title", file_id)),
+                status="coding",
+                depends_on=full_deps,
+                created_at=now,
+                updated_at=now,
+                meta={
+                    "exit_criteria": {
+                        "coding": f"Implement {file_id} according to spec",
+                        "done": "File passes unit tests and integrates with module",
+                    },
+                },
+                parent_id=module,
+            )
+            self.append(entry)
+            created.append(entry)
+        return created
+
+    def sub_tasks(self, module: str) -> List[TaskEntry]:
+        """Return all sub-tasks for a module (latest snapshot)."""
+
+        latest = self.load_latest()
+        prefix = f"{module}::"
+        return [
+            t
+            for t in latest.values()
+            if t.parent_id == module or t.id.startswith(prefix)
+        ]
+
+    def ready_sub_tasks(self, module: str) -> List[TaskEntry]:
+        """Return sub-tasks whose intra-module dependencies are met and not done."""
+
+        latest = self.load_latest()
+        subs = self.sub_tasks(module)
+        ready: List[TaskEntry] = []
+        for t in subs:
+            if t.status == "done":
+                continue
+            if self.is_ready(t, latest):
+                ready.append(t)
+        return ready
+
+    def all_sub_tasks_done(self, module: str) -> bool:
+        """Check if all file-level sub-tasks for a module are done."""
+
+        subs = self.sub_tasks(module)
+        if not subs:
+            return True
+        return all(t.status == "done" for t in subs)
+
+    # ── Module-level operations ───────────────────────────────────────
+
     def ready_tasks(self) -> List[TaskEntry]:
-        """Return tasks whose dependencies are satisfied and not done."""
+        """Return module-level tasks whose dependencies are satisfied and not done."""
 
         latest = self.load_latest()
         ready: List[TaskEntry] = []
         for task in latest.values():
+            if task.is_sub_task:
+                continue
             if task.status == "done":
                 continue
             if self.is_ready(task, latest):

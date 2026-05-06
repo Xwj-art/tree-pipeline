@@ -1,23 +1,30 @@
 # tree-pipeline（树形并行开发流水线）- Claude Code Skill
 
-本 Skill 用于把“需求输入 → 规格冻结 → DAG 批次并行实现 → 契约验证/CDC/集成测试 → 看板汇总”的流程标准化，适合多模块/多子系统并行开发的工程任务。
+本 Skill 用于把”需求输入 → 规格冻结 → DAG 批次并行实现 → 契约验证/CDC/集成测试 → 看板汇总”的流程标准化，适合多模块/多子系统并行开发的工程任务。
 
 ## 触发方式
 
 - 在对话中说：`tree-pipeline` 或 “树形并行流水线”
-- 或者直接让 Claude 执行：`python -m pipeline.orchestrator start ...`
+- 描述需求时提及：**多模块并行开发**、**按依赖图分批实现**、**先冻结契约再编码**、**需要断点续跑**、**模块间有契约依赖**
+- 或者直接让 Claude 执行：`python3 -m pipeline.orchestrator start ...`
 
 ## 适用场景
 
 - 需求较大，且可拆分为多个模块（有明确依赖关系）
 - 希望先冻结契约（`contract.yaml`），再并行编码
 - 希望用任务账本（`tasks.jsonl`）+ 看板（`dashboard.md`）做断点续跑与审计
-- 需要“微批次测试（2-5 个函数一组）”与“风险驱动覆盖率（80-90% 行覆盖 + 场景清单 + CDC）”
+- 需要”微批次测试（2-5 个函数一组）”与”风险驱动覆盖率（80-90% 行覆盖 + 场景清单 + CDC）”
 
-## 二层架构（关键决策）
+## 三层架构（关键决策）
 
-- 主编排器：`pipeline/orchestrator.py`（生成 Spec + 构建 DAG 批次 + 冻结契约 + 汇总看板）
-- 模块 Agent：由主编排器输出“模块任务包”（context packet）与执行指令，Claude 作为模块 Agent 按包内上下文实现与自测
+```
+主编排器 → DAG 分批 → 模块 Agent（并行）
+                         ↳ dispatch → Worker Agent × N（文件级并行）
+```
+
+- **主编排器**：`pipeline/orchestrator.py` — 生成 Spec + 构建 DAG 批次 + 冻结契约 + 汇总看板
+- **模块 Agent**：Claude 读 context_packet，规划模块内文件拆分，调用 `dispatch` 分发到 Worker
+- **Worker Agent × N**：每个 Worker 拿一个文件的 context_packet，独立实现并标记 done
 
 ## 使用步骤（推荐）
 
@@ -28,7 +35,10 @@
    - `python -m pipeline.orchestrator start --project-root <你的项目根目录> --run-dir <本次运行目录>`
 3. 按 DAG 批次并行执行（Batch1/Batch2...）：
    - 编排器会为每个模块生成 `context_packet.md`（最小上下文包）
-   - 你可以把该包发给 Claude（模块 Agent），并让其按包内指令完成模块实现 + 微批次单测
+   - 模块 Agent 规划文件拆分，创建 plan.json，执行 `dispatch`：
+     `python3 -m pipeline.orchestrator dispatch --run-dir <dir> --module <name> --plan plan.json`
+   - Worker Agent 各自拿一个文件级 context_packet 并行实现
+   - Worker 完成后标记 `done`，模块 Agent 收集结果 + 微批次单测
 4. 完成后运行验证阶段：
    - `python -m pipeline.orchestrator validate --run-dir <本次运行目录>`
 5. 任何时候查看状态：
@@ -47,15 +57,15 @@
 
 tree-pipeline 是**多模块并行开发的总统筹层**，不是单模块实现者：
 
-| 负责                            | 不负责           | 委托给                      |
-| ------------------------------- | ---------------- | --------------------------- |
-| Spec 生成 + 契约冻结 + DAG 分批 | 详细实现方案叙事 | `planner` agent             |
-| JSONL 任务账本 + 状态机管理     | 模块级代码实现   | 模块 Agent (Claude)         |
-| Context Packet 构建与分发       | 代码审查         | `code-reviewer` agent       |
-| 契约校验（签名 + semver）       | TDD 测试编写     | `tdd-guide` agent           |
-| dashboard.md 看板汇总           | Git 提交/PR 流程 | `prp-commit` / git-workflow |
-| 测试钩子触发                    | CI/CD 部署       | 项目自身 CI 系统            |
-| 中断恢复（resume）              | Mutation Testing | 夜间 CI（仅预留钩子）       |
+| 负责                                       | 不负责            | 委托给                      |
+| ------------------------------------------ | ----------------- | --------------------------- |
+| Spec 生成 + 契约冻结 + DAG 分批            | 详细实现方案叙事  | `planner` agent             |
+| JSONL 任务账本（含子任务） + 状态机        | 模块/文件代码实现 | 模块 Agent / Worker Agent   |
+| Context Packet 构建与分发（模块+文件级）   | 代码审查          | `code-reviewer` agent       |
+| `dispatch` 文件级任务分发 + 内部 DAG       | TDD 测试编写      | `tdd-guide` agent           |
+| 契约校验（签名 + semver）                  | Git 提交/PR 流程  | `prp-commit` / git-workflow |
+| dashboard.md 看板汇总（模块+File Workers） | CI/CD 部署        | 项目自身 CI 系统            |
+| 中断恢复（resume）                         | Mutation Testing  | 夜间 CI（仅预留钩子）       |
 
 ## 安装
 

@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .context_packet import ContextPacketBuilder
+from .context_packet import ContextPacketBuilder, hard_truncate
 from .dashboard import DashboardGenerator
 from .graph import GraphBatches, build_topological_batches, edges_from_strings
 from .runners.test_runner import TestRunner
@@ -288,6 +288,83 @@ class Orchestrator:
 
         return failed_modules
 
+    def dispatch_files(
+        self,
+        *,
+        run_dir: str,
+        module: str,
+        plan_path: str,
+    ) -> List[TaskEntry]:
+        """Dispatch file-level sub-tasks for a module to worker agents.
+
+        Reads a JSON plan file: {files: [{id, title, depends_on}]}.
+        Creates sub-tasks in the ledger and per-file context packets.
+        """
+
+        plan = load_yaml_or_json(plan_path)
+        files_raw = plan.get("files", [])
+        if not isinstance(files_raw, list) or not files_raw:
+            raise ValueError("Plan must contain a non-empty 'files' list")
+
+        files: List[Dict[str, object]] = []
+        for f in files_raw:
+            if not isinstance(f, dict):
+                raise ValueError(f"Invalid file entry: {f!r}")
+            files.append(f)
+
+        ledger_path = os.path.join(run_dir, self.config.ledger_file_name)
+        ledger = TaskLedger(ledger_path, allow_skip_states=self.config.allow_skip_states)
+
+        # Create sub-tasks
+        sub_tasks = ledger.create_sub_tasks(module=module, files=files)
+
+        # Generate per-file context packets
+        contract_path = os.path.join(run_dir, self.config.contract_file_name)
+        spec_path = os.path.join(run_dir, self.config.spec_file_name)
+        contract_text = read_text(contract_path) if os.path.exists(contract_path) else ""
+        spec_text = read_text(spec_path) if os.path.exists(spec_path) else ""
+
+        packets_dir = os.path.join(run_dir, "context_packets")
+        os.makedirs(packets_dir, exist_ok=True)
+        for f in files:
+            file_id = str(f["id"])
+            content = (
+                f"# File Task: {file_id}\n\n"
+                f"## Module: {module}\n\n"
+                f"## Description\n{str(f.get('title', file_id))}\n\n"
+                "## Contract (Relevant)\n"
+                f"{hard_truncate(contract_text, self.config.contract_excerpt_max_tokens)}\n\n"
+                "## Spec (Relevant)\n"
+                f"{hard_truncate(spec_text, self.config.spec_excerpt_max_tokens)}\n\n"
+                "## Worker Instructions\n"
+                f"- Implement this file: `{file_id}`\n"
+                "- Follow the frozen contract signatures exactly\n"
+                "- Mark task as 'done' when implementation passes unit tests\n"
+            )
+            packet_path = os.path.join(packets_dir, f"{module}__{file_id.replace('/', '_')}.md")
+            write_text(packet_path, content)
+
+        # Advance module task to 'coding' if not already there
+        latest = ledger.load_latest()
+        mod_task = latest.get(module)
+        if mod_task:
+            if mod_task.status == "planned":
+                ledger.update_status(module, "spec_ready")
+                ledger.update_status(module, "coding")
+            elif mod_task.status == "spec_ready":
+                ledger.update_status(module, "coding")
+
+        # Update dashboard
+        batches = [[module]]
+        dash_path = os.path.join(run_dir, self.config.dashboard_file_name)
+        DashboardGenerator(ledger).render(
+            run_id=os.path.basename(os.path.abspath(run_dir)),
+            batches=batches,
+            output_path=dash_path,
+        )
+
+        return sub_tasks
+
     @staticmethod
     def _parse_failed_modules_from_error(error_text: str) -> List[str]:
         """Parse module names from a ContractValidationError message."""
@@ -531,6 +608,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_validate.add_argument("--run-dir", required=True)
     p_validate.add_argument("--project-root", required=True)
 
+    p_dispatch = sub.add_parser("dispatch", help="Dispatch file-level tasks to worker agents")
+    p_dispatch.add_argument("--run-dir", required=True)
+    p_dispatch.add_argument("--module", required=True)
+    p_dispatch.add_argument("--plan", required=True, help="JSON file describing files to create")
+
     args = p.parse_args(argv)
 
     config_path = _resolve_config_path(args.config)
@@ -562,6 +644,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.cmd == "validate":
         orch.validate(run_dir=args.run_dir, project_root=args.project_root)
+        return 0
+
+    if args.cmd == "dispatch":
+        orch.dispatch_files(
+            run_dir=args.run_dir,
+            module=args.module,
+            plan_path=args.plan,
+        )
         return 0
 
     raise AssertionError(f"Unhandled command: {args.cmd}")
