@@ -1,0 +1,103 @@
+# tree-pipeline default configuration (YAML)
+#
+# This file is intended to be copied/overridden per project run.
+# All values have sensible defaults and are safe to keep as-is for a dry run.
+
+version: 1
+
+paths:
+  templates_dir: templates
+  artifacts_dir: artifacts
+  run_dir_name: tree-pipeline-run
+  context_packets_dir: context_packets
+
+orchestrator:
+  token_budget:
+    context_packet_max_tokens: 2200
+    spec_excerpt_max_tokens: 900
+    contract_excerpt_max_tokens: 700
+    conventions_max_tokens: 500
+    lock_excerpt_max_tokens: 300
+  batching:
+    max_parallel_modules_per_batch: 8
+  micro_batch_tests:
+    enabled: true
+    functions_per_batch_min: 2
+    functions_per_batch_max: 5
+  quality_gates:
+    max_refactor_rounds: 1
+    coverage:
+      strategy: risk_driven
+      line_coverage_target_min: 0.80
+      line_coverage_target_max: 0.90
+      require_scenario_checklist: true
+      require_cdc: true
+  feature_flags:
+    enabled: true
+    selective: true
+    naming_prefix: "FF_"
+  mutation_testing:
+    enabled: false
+    schedule: nightly
+
+modules:
+  # Default: empty; pass modules via CLI or override config.
+  items: []
+  # Example:
+  # items:
+  #   - name: core
+  #     description: "Core domain logic"
+  #   - name: api
+  #     description: "REST API layer"
+  #   - name: ui
+  #     description: "Frontend"
+
+dependencies:
+  # List of edges: "consumer:provider"
+  edges: []
+  # Example:
+  # edges: ["ui:api", "api:core"]
+
+contract:
+  file_name: contract.yaml
+  default_version: "1.0.0"
+  compatibility:
+    # If true, major version mismatch fails validation.
+    require_same_major: true
+    # If true, missing required signature is an error.
+    require_signatures: true
+
+spec:
+  file_name: spec.md
+  include_sections:
+    - overview
+    - module_breakdown
+    - dependencies
+    - risks
+    - acceptance_criteria
+
+conventions:
+  file_name: conventions.md
+
+ledger:
+  file_name: tasks.jsonl
+  dashboard_file_name: dashboard.md
+  status_model: v1
+  allow_skip_states: false
+
+commands:
+  # Test hooks. Uncomment and customize for your project.
+  # Contract validation is built-in (no external command needed).
+  # unit_tests:
+  #   command: "python3 -m pytest -q"
+  #   cwd: "{project_root}"
+  # integration_tests:
+  #   command: "python3 -m pytest -q -m integration"
+  #   cwd: "{project_root}"
+  # cdc_tests:
+  #   command: "python3 -m pytest -q -m cdc"
+  #   cwd: "{project_root}"
+
+logging:
+  level: INFO
+  json: false
