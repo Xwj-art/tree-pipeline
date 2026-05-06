@@ -2,14 +2,15 @@
 
 `tree-pipeline` 是一个用于“树形并行开发流水线”的轻量实现：以冻结契约（contract-first）为核心，用依赖图（DAG）分批并行推进模块开发，并以 `tasks.jsonl` + `dashboard.md` 实现可恢复、可审计的进度管理。
 
-## 目标流程（精简二层架构）
+## 目标流程（三层架构）
 
-需求输入 → **主编排器**（Spec 生成 + DAG 分发 + 契约冻结） → **Batch1**（无依赖模块并行） → **Batch2**（依赖就绪模块并行） → 契约验证 + CDC + 集成测试 → 看板汇总
+需求输入 → **主编排器**（Spec + DAG + 契约冻结） → **模块 Agent** 并行 → **dispatch** → **Worker Agent × N** 文件级并行 → 验证 + 看板
 
-## 关键策略（与需求对齐）
+## 关键策略
 
-- 二层 Agent：主编排器 + 模块 Agent
-- 微批次测试：2-5 个函数一组（由模块 Agent 自行拆分并执行）
+- 三层 Agent：主编排器 → 模块 Agent → Worker Agent（文件级并行）
+- 微批次测试：2-5 个函数一组
+- 模块内 DAG：文件间可声明依赖，Worker 按就绪顺序分发
 - 风险驱动覆盖率：80-90% 行覆盖 + 场景清单 + CDC（不追求 100% 分支）
 - 重构封顶：最多 1 轮；仍不通过则升级人工
 - Selective Feature Flags：高风险路径用 Flag 包裹，支持快速回滚
@@ -53,14 +54,18 @@ python3 -m pipeline.orchestrator start \
   --module api --module core --module ui \
   --edge ui:api --edge api:core
 
-# 3. 查看 dashboard
+# 3. 模块 Agent 拆分文件并分发 Worker
+echo '{"files":[{"id":"src/models.py","title":"Data models","depends_on":[]},{"id":"src/service.py","title":"Business logic","depends_on":["src/models.py"]}]}' > /tmp/plan.json
+python3 -m pipeline.orchestrator dispatch --run-dir /tmp/tp-run --module api --plan /tmp/plan.json
+
+# 4. 查看 dashboard（含 File Workers）
 cat /tmp/tp-run/dashboard.md
 
-# 4. 执行契约校验
+# 5. 执行契约校验
 python3 -m pipeline.orchestrator validate \
   --run-dir /tmp/tp-run --project-root .
 
-# 5. 中断后恢复
+# 6. 中断后恢复
 python3 -m pipeline.orchestrator resume --run-dir /tmp/tp-run
 ```
 
