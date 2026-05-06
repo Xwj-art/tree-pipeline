@@ -60,12 +60,23 @@ tree-pipeline 是**多模块并行开发的总统筹层**，不是单模块实�
 ## 安装
 
 ```bash
-# 克隆并安装为可全局调用的 Python 包
+# 克隆到 Claude Code 全局 skill 目录
 git clone git@github.com:Xwj-art/tree-pipeline.git ~/.claude/skills/tree-pipeline
+
+# 方式一：pip 可编辑安装（推荐，非 Homebrew Python）
 pip install -e ~/.claude/skills/tree-pipeline
 
+# 方式二：Homebrew Python（macOS 默认）— 使用 PYTHONPATH
+# 在 ~/.claude/settings.json 中添加：
+#   "env": {"PYTHONPATH": "$HOME/.claude/skills/tree-pipeline"}
+# 或每次执行时：
+PYTHONPATH=~/.claude/skills/tree-pipeline python3 -m pipeline.orchestrator --help
+
+# 方式三：pipx（Homebrew 推荐）
+brew install pipx && pipx install --editable ~/.claude/skills/tree-pipeline
+
 # 验证安装
-python -m pipeline.orchestrator --help
+python3 -m pipeline.orchestrator --help
 ```
 
 ## 输出物（run-dir 下）

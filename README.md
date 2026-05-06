@@ -25,11 +25,17 @@
 # 克隆到 Claude Code 全局 skill 目录
 git clone git@github.com:Xwj-art/tree-pipeline.git ~/.claude/skills/tree-pipeline
 
-# 安装为可全局调用的 Python 包
+# 方式一：pip 可编辑安装（非 Homebrew Python）
 pip install -e ~/.claude/skills/tree-pipeline
 
+# 方式二：Homebrew Python（macOS 默认）— 使用 PYTHONPATH
+PYTHONPATH=~/.claude/skills/tree-pipeline python3 -m pipeline.orchestrator --help
+
+# 方式三：pipx（Homebrew 推荐）
+brew install pipx && pipx install --editable ~/.claude/skills/tree-pipeline
+
 # 验证
-python -m pipeline.orchestrator --help
+python3 -m pipeline.orchestrator --help
 ```
 
 可选依赖：`pip install PyYAML`（解析 YAML 配置/契约文件；未安装时可用 JSON）。
@@ -41,7 +47,7 @@ python -m pipeline.orchestrator --help
 mkdir -p /tmp/tp-run
 
 # 2. 启动流水线（3 个模块，UI→API→Core 依赖链）
-python -m pipeline.orchestrator start \
+python3 -m pipeline.orchestrator start \
   --project-root . \
   --run-dir /tmp/tp-run \
   --module api --module core --module ui \
@@ -51,18 +57,18 @@ python -m pipeline.orchestrator start \
 cat /tmp/tp-run/dashboard.md
 
 # 4. 执行契约校验
-python -m pipeline.orchestrator validate \
+python3 -m pipeline.orchestrator validate \
   --run-dir /tmp/tp-run --project-root .
 
 # 5. 中断后恢复
-python -m pipeline.orchestrator resume --run-dir /tmp/tp-run
+python3 -m pipeline.orchestrator resume --run-dir /tmp/tp-run
 ```
 
 ## 冒烟测试
 
 ```bash
 TMPDIR=$(mktemp -d)
-python -m pipeline.orchestrator start \
+python3 -m pipeline.orchestrator start \
   --project-root . --run-dir "$TMPDIR" \
   --module mod_a --module mod_b \
   --edge mod_b:mod_a
@@ -77,11 +83,11 @@ test -f "$TMPDIR/context_packets/mod_a.md" && echo "PASS: context_packet mod_a"
 test -f "$TMPDIR/context_packets/mod_b.md" && echo "PASS: context_packet mod_b"
 
 # 验证契约校验
-python -m pipeline.orchestrator validate --run-dir "$TMPDIR" --project-root . \
+python3 -m pipeline.orchestrator validate --run-dir "$TMPDIR" --project-root . \
   && echo "PASS: contract validate"
 
 # 验证状态
-python -m pipeline.orchestrator status --run-dir "$TMPDIR" \
+python3 -m pipeline.orchestrator status --run-dir "$TMPDIR" \
   --module mod_a --module mod_b --edge mod_b:mod_a \
   && echo "PASS: status"
 
