@@ -1,16 +1,15 @@
 """
-Pipeline orchestrator (two-layer architecture).
+Pipeline orchestrator (three-layer architecture).
 
 This file provides a CLI that:
 - generates frozen spec + initial contract
 - builds DAG batches
 - creates/updates a JSONL task ledger
-- builds minimal context packets per module under token budgets
+- builds minimal context packets per module and per file under token budgets
+- dispatches file-level sub-tasks to Worker Agents for parallel coding
 - runs contract validation and optional test hooks
 
-The "module agent" is not an executable subprocess here; instead, the
-orchestrator produces context packets and ledger updates that a human/Claude
-module agent can follow.
+Three layers: Orchestrator → Module Agent (dispatch) → Worker Agent × N (file-level).
 """
 
 from __future__ import annotations
@@ -189,7 +188,6 @@ class Orchestrator:
         self._write_initial_contract(
             run_id=run_id,
             run_dir=run_dir,
-            templates_dir=templates_dir,
             modules=modules,
         )
 
@@ -204,19 +202,44 @@ class Orchestrator:
             modules=modules,
         )
 
+        self.write_run_manifest(
+            run_dir=run_dir,
+            modules=modules,
+            edges=edges,
+            batches=batches.batches,
+        )
+
         dash_path = os.path.join(run_dir, self.config.dashboard_file_name)
         DashboardGenerator(ledger).render(
             run_id=run_id, batches=batches.batches, output_path=dash_path
         )
 
-    def resume(self, *, run_dir: str, batches: List[List[str]]) -> None:
-        """Regenerate dashboard for an existing run (safe resume)."""
+    def resume(self, *, run_dir: str, batches: List[List[str]]) -> str:
+        """Resume a run: auto-unblock stale blocks, then refresh the dashboard.
+
+        Unlike status (read-only), resume actively scans for blocked tasks
+        whose dependencies are now satisfied and clears their block, allowing
+        the pipeline to progress without manual intervention.
+        """
 
         ledger_path = os.path.join(run_dir, self.config.ledger_file_name)
         ledger = TaskLedger(ledger_path, allow_skip_states=self.config.allow_skip_states)
+        latest = ledger.load_latest()
+
+        auto_unblocked: List[str] = []
+        for task in latest.values():
+            if task.is_sub_task:
+                continue
+            if task.meta.get("blocked") and ledger.is_ready(task, latest):
+                ledger.unblock_task(task.id)
+                auto_unblocked.append(task.id)
+
+        if auto_unblocked:
+            print(f"[resume] Auto-unblocked: {', '.join(auto_unblocked)}")
+
         run_id = os.path.basename(os.path.abspath(run_dir))
         dash_path = os.path.join(run_dir, self.config.dashboard_file_name)
-        DashboardGenerator(ledger).render(
+        return DashboardGenerator(ledger).render(
             run_id=run_id, batches=batches, output_path=dash_path
         )
 
@@ -277,22 +300,6 @@ class Orchestrator:
             )
             print(f"[validate] Exit code: {res.returncode}")
 
-            # Auto-update task states from test results
-            passed_modules = self._parse_vitest_modules(res.stdout)
-            latest = ledger.load_latest()
-            from .task_ledger import STATUS_ORDER
-            for mod in latest.values():
-                if mod.is_sub_task:
-                    continue
-                if mod.module in passed_modules and mod.status != "done":
-                    current_idx = STATUS_ORDER.index(mod.status)
-                    for target in STATUS_ORDER[current_idx + 1:]:
-                        try:
-                            ledger.update_status(mod.id, target)
-                            print(f"[validate] {mod.module}: {mod.status} -> {target}")
-                        except ValueError:
-                            continue
-
             if not res.ok:
                 raise RuntimeError(
                     "Tests failed:\n" + res.stdout[-2000:] + "\n" + res.stderr[-1000:]
@@ -330,6 +337,98 @@ class Orchestrator:
 
         return failed_modules
 
+    def mark_file_done(self, *, run_dir: str, task_id: str) -> str:
+        """Mark a file sub-task as done with full auto-advance chain.
+
+        1. Transition file: coding→testing→done
+        2. Auto-unlock downstream files (planned→ready)
+        3. If all files done, auto-advance module to unit_tests
+        4. Refresh dashboard
+        """
+
+        ledger_path = os.path.join(run_dir, self.config.ledger_file_name)
+        ledger = TaskLedger(ledger_path, allow_skip_states=True)
+        entry = ledger.update_status(task_id, "done")
+
+        module = task_id.split("::", 1)[0]
+
+        unlocked = ledger.unlock_file_deps(module, task_id)
+        if unlocked:
+            names = ", ".join(u.id for u in unlocked)
+            print(f"[file-done] Auto-unlocked: {names}")
+
+        result = f"File marked done: {entry.id} -> {entry.status}"
+        if ledger.all_sub_tasks_done(module):
+            latest = ledger.load_latest()
+            mod_task = latest.get(module)
+            if mod_task and mod_task.status == "coding":
+                ledger.update_status(module, "unit_tests")
+                result += f"\nModule {module}: coding -> unit_tests (all {len(ledger.sub_tasks(module))} files done)"
+
+        dash_path = os.path.join(run_dir, self.config.dashboard_file_name)
+        DashboardGenerator(ledger).render(
+            run_id=os.path.basename(os.path.abspath(run_dir)),
+            batches=[],
+            output_path=dash_path,
+        )
+        return result
+
+    def check_module(self, *, run_dir: str, module: str) -> str:
+        """Diagnostic: show per-status file counts for a module."""
+
+        ledger_path = os.path.join(run_dir, self.config.ledger_file_name)
+        ledger = TaskLedger(ledger_path, allow_skip_states=self.config.allow_skip_states)
+
+        subs = ledger.sub_tasks(module)
+        if not subs:
+            return f"Module {module}: no file sub-tasks."
+
+        by_status: Dict[str, List[str]] = {}
+        for s in subs:
+            by_status.setdefault(s.status, []).append(s.id)
+
+        lines = [f"Module {module} file status:"]
+        for st in ["planned", "ready", "coding", "testing", "done", "blocked"]:
+            ids = by_status.get(st, [])
+            if ids:
+                lines.append(f"  {st}: {len(ids)} files")
+        return "\n".join(lines)
+
+    def file_start(self, *, run_dir: str, task_id: str) -> TaskEntry:
+        """Claim a file sub-task (ready→coding). Called by Worker Agent."""
+
+        ledger_path = os.path.join(run_dir, self.config.ledger_file_name)
+        ledger = TaskLedger(ledger_path, allow_skip_states=True)
+        return ledger.update_status(task_id, "coding")
+
+    # ── Run manifest ──────────────────────────────────────────────────
+
+    def run_manifest_path(self, run_dir: str) -> str:
+        return os.path.join(run_dir, "run_manifest.json")
+
+    def write_run_manifest(
+        self, *, run_dir: str,
+        modules: Sequence[str], edges: Sequence[Tuple[str, str]],
+        batches: List[List[str]],
+    ) -> None:
+        import json as _json
+        manifest = {
+            "modules": list(modules),
+            "edges": [f"{c}:{p}" for c, p in edges],
+            "batches": batches,
+            "created_at": utc_now_iso(),
+        }
+        with open(self.run_manifest_path(run_dir), "w", encoding="utf-8") as f:
+            _json.dump(manifest, f, indent=2)
+
+    def read_run_manifest(self, run_dir: str) -> Dict[str, Any]:
+        import json as _json
+        path = self.run_manifest_path(run_dir)
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            return _json.load(f)
+
     def dispatch_files(
         self,
         *,
@@ -360,11 +459,13 @@ class Orchestrator:
         # Create sub-tasks
         sub_tasks = ledger.create_sub_tasks(module=module, files=files)
 
-        # Generate per-file context packets
+        # Generate per-file context packets with module-specific excerpts
         contract_path = os.path.join(run_dir, self.config.contract_file_name)
         spec_path = os.path.join(run_dir, self.config.spec_file_name)
-        contract_text = read_text(contract_path) if os.path.exists(contract_path) else ""
-        spec_text = read_text(spec_path) if os.path.exists(spec_path) else ""
+        full_contract = read_text(contract_path) if os.path.exists(contract_path) else ""
+        full_spec = read_text(spec_path) if os.path.exists(spec_path) else ""
+        module_contract = self._extract_module_contract(full_contract, module) or full_contract
+        module_spec = self._extract_module_spec(full_spec, module) or full_spec
 
         packets_dir = os.path.join(run_dir, "context_packets")
         os.makedirs(packets_dir, exist_ok=True)
@@ -375,13 +476,13 @@ class Orchestrator:
                 f"## Module: {module}\n\n"
                 f"## Description\n{str(f.get('title', file_id))}\n\n"
                 "## Contract (Relevant)\n"
-                f"{hard_truncate(contract_text, self.config.contract_excerpt_max_tokens)}\n\n"
+                f"{hard_truncate(module_contract, self.config.contract_excerpt_max_tokens)}\n\n"
                 "## Spec (Relevant)\n"
-                f"{hard_truncate(spec_text, self.config.spec_excerpt_max_tokens)}\n\n"
+                f"{hard_truncate(module_spec, self.config.spec_excerpt_max_tokens)}\n\n"
                 "## Worker Instructions\n"
                 f"- Implement this file: `{file_id}`\n"
                 "- Follow the frozen contract signatures exactly\n"
-                "- Mark task as 'done' when implementation passes unit tests\n"
+                f"- Mark task as 'done': `python3 -m pipeline.orchestrator file-done --run-dir <dir> --task-id {module}::{file_id}`\n"
             )
             packet_path = os.path.join(packets_dir, f"{module}__{file_id.replace('/', '_')}.md")
             write_text(packet_path, content)
@@ -479,30 +580,15 @@ class Orchestrator:
         *,
         run_id: str,
         run_dir: str,
-        templates_dir: str,
         modules: Sequence[str],
     ) -> None:
-        tpl = read_text(os.path.join(templates_dir, "contract.yaml.tpl"))
-        rendered_modules: List[str] = []
-        for m in modules:
-            rendered_modules.append(
-                simple_template_render(
-                    tpl,
-                    {
-                        "contract_version": "1.0.0",
-                        "generated_at": utc_now_iso(),
-                        "module_name": m,
-                        "module_description": f"{m} module",
-                    },
-                ).strip()
-            )
         contract_content = (
             "# contract.yaml - generated by tree-pipeline\n\n"
             "version: \"1.0.0\"\n"
             f"generated_at: \"{utc_now_iso()}\"\n\n"
             "modules:\n"
         )
-        # Keep a minimal initial contract; users will refine provides/requires.
+        # Minimal initial contract; users will refine provides/requires.
         for m in modules:
             contract_content += (
                 f"  - name: \"{m}\"\n"
@@ -582,11 +668,12 @@ class Orchestrator:
             "pnpm-lock.yaml",
             "yarn.lock",
         ]
+        max_chars = self.config.lock_excerpt_max_tokens * 4
         for name in candidates:
             path = os.path.join(project_root, name)
             if os.path.exists(path):
                 try:
-                    return read_text(path)[:4000]
+                    return read_text(path)[:max_chars]
                 except Exception:
                     return ""
         return ""
@@ -675,19 +762,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_status = sub.add_parser("status", help="Render dashboard for an existing run")
     p_status.add_argument("--run-dir", required=True)
-    p_status.add_argument("--module", action="append", default=[])
-    p_status.add_argument(
-        "--edge", action="append", default=[],
-        help="Dependency edge: DEPENDENT:DEPENDENCY",
-    )
+    p_status.add_argument("--module", action="append", default=[], help="Optional: override manifest")
+    p_status.add_argument("--edge", action="append", default=[], help="Optional: override manifest")
 
-    p_resume = sub.add_parser("resume", help="Alias for status (safe resume)")
+    p_resume = sub.add_parser("resume", help="Resume a run: auto-unblock + refresh dashboard")
     p_resume.add_argument("--run-dir", required=True)
-    p_resume.add_argument("--module", action="append", default=[])
-    p_resume.add_argument(
-        "--edge", action="append", default=[],
-        help="Dependency edge: DEPENDENT:DEPENDENCY",
-    )
+    p_resume.add_argument("--module", action="append", default=[], help="Optional: override manifest")
+    p_resume.add_argument("--edge", action="append", default=[], help="Optional: override manifest")
 
     p_validate = sub.add_parser("validate", help="Validate contract + run test hooks")
     p_validate.add_argument("--run-dir", required=True)
@@ -698,6 +779,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_dispatch.add_argument("--run-dir", required=True)
     p_dispatch.add_argument("--module", required=True)
     p_dispatch.add_argument("--plan", required=True, help="JSON file describing files to create")
+
+    p_file_start = sub.add_parser("file-start", help="Claim a file sub-task (Worker Agent)")
+    p_file_start.add_argument("--run-dir", required=True)
+    p_file_start.add_argument("--task-id", required=True, help="Sub-task id (e.g. api::src/models.py)")
+
+    p_file_done = sub.add_parser("file-done", help="Mark a file sub-task as done + auto-advance")
+    p_file_done.add_argument("--run-dir", required=True)
+    p_file_done.add_argument("--task-id", required=True, help="Sub-task id (e.g. api::src/models.py)")
+
+    p_module_check = sub.add_parser("module-check", help="Show per-status file counts for a module")
+    p_module_check.add_argument("--run-dir", required=True)
+    p_module_check.add_argument("--module", required=True)
+
+    p_next = sub.add_parser("next", help="Show the next ready modules and files")
+    p_next.add_argument("--run-dir", required=True)
 
     args = p.parse_args(argv)
 
@@ -714,7 +810,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         # Auto-read modules/edges from YAML config if not passed via CLI
         if not modules:
+            # Support both: modules as a list, and modules.items as a list
             cfg_modules = deep_get(config, "modules", None)
+            if isinstance(cfg_modules, dict):
+                cfg_modules = cfg_modules.get("items", cfg_modules)
             if cfg_modules and isinstance(cfg_modules, list):
                 for m in cfg_modules:
                     if isinstance(m, dict):
@@ -724,18 +823,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                     elif isinstance(m, str):
                         modules.append(m)
         if not edges:
-            # Read edges from config: each module dict has depends_on list
-            cfg_modules = deep_get(config, "modules", None)
-            if cfg_modules and isinstance(cfg_modules, list):
-                edge_strs = []
-                for m in cfg_modules:
-                    if isinstance(m, dict):
-                        name = m.get("name", "")
-                        deps = m.get("depends_on", [])
-                        if name and isinstance(deps, list):
-                            for dep in deps:
-                                edge_strs.append(f"{name}:{dep}")
-                edges = edges_from_strings(edge_strs)
+            # Support both: dependencies.edges as a list, and modules[].depends_on
+            dep_edges = deep_get(config, "dependencies.edges", None)
+            if dep_edges and isinstance(dep_edges, list):
+                edges = edges_from_strings([str(e) for e in dep_edges])
+            else:
+                cfg_modules = deep_get(config, "modules", None)
+                if isinstance(cfg_modules, dict):
+                    cfg_modules = cfg_modules.get("items", cfg_modules)
+                if cfg_modules and isinstance(cfg_modules, list):
+                    edge_strs = []
+                    for m in cfg_modules:
+                        if isinstance(m, dict):
+                            name = m.get("name", "")
+                            deps = m.get("depends_on", [])
+                            if name and isinstance(deps, list):
+                                for dep in deps:
+                                    edge_strs.append(f"{name}:{dep}")
+                    edges = edges_from_strings(edge_strs)
 
         if not modules:
             raise ValueError(
@@ -752,11 +857,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 0
 
-    if args.cmd in ("status", "resume"):
-        modules = _parse_modules(args.module)
-        edge_strs: List[str] = list(args.edge)
-        batches = _infer_batches_from_edges(modules, edge_strs) if modules else []
+    def _batches_from_manifest_or_args():
+        """Resolve batches from run manifest, falling back to CLI args."""
+        manifest = orch.read_run_manifest(args.run_dir)
+        if manifest and manifest.get("batches"):
+            # use cached batches if no CLI override
+            if not args.module and not args.edge:
+                return manifest["batches"]
+        modules = _parse_modules(getattr(args, 'module', []))
+        edge_strs = list(getattr(args, 'edge', []))
+        return _infer_batches_from_edges(modules, edge_strs) if modules else []
+
+    if args.cmd == "status":
+        batches = _batches_from_manifest_or_args()
         print(orch.status(run_dir=args.run_dir, batches=batches))
+        return 0
+
+    if args.cmd == "resume":
+        batches = _batches_from_manifest_or_args()
+        print(orch.resume(run_dir=args.run_dir, batches=batches))
         return 0
 
     if args.cmd == "validate":
@@ -777,6 +896,27 @@ def main(argv: Optional[List[str]] = None) -> int:
             module=args.module,
             plan_path=args.plan,
         )
+        return 0
+
+    if args.cmd == "file-start":
+        entry = orch.file_start(run_dir=args.run_dir, task_id=args.task_id)
+        print(f"File claimed: {entry.id} -> {entry.status}")
+        return 0
+
+    if args.cmd == "file-done":
+        result = orch.mark_file_done(run_dir=args.run_dir, task_id=args.task_id)
+        print(result)
+        return 0
+
+    if args.cmd == "module-check":
+        result = orch.check_module(run_dir=args.run_dir, module=args.module)
+        print(result)
+        return 0
+
+    if args.cmd == "next":
+        manifest = orch.read_run_manifest(args.run_dir)
+        batches = manifest.get("batches", []) if manifest else []
+        print(orch.status(run_dir=args.run_dir, batches=batches))
         return 0
 
     raise AssertionError(f"Unhandled command: {args.cmd}")

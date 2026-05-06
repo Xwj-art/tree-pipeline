@@ -37,6 +37,35 @@ STATUS_ORDER: List[TaskStatus] = [
     "done",
 ]
 
+# ── Sub-task (file-level) states ─────────────────────────────────────
+
+SubTaskStatus = Literal[
+    "planned",   # created but dependencies not yet met
+    "ready",     # deps met, can be dispatched to a worker
+    "coding",    # worker is implementing
+    "testing",   # unit tests running
+    "done",      # complete
+    "blocked",   # failure or contract mismatch, needs attention
+]
+
+SUB_STATUS_ORDER: List[SubTaskStatus] = [
+    "planned",
+    "ready",
+    "coding",
+    "testing",
+    "done",
+    "blocked",
+]
+
+SUB_ALLOWED_TRANSITIONS: Dict[SubTaskStatus, List[SubTaskStatus]] = {
+    "planned": ["ready", "blocked"],
+    "ready": ["coding"],
+    "coding": ["testing", "blocked"],
+    "testing": ["done", "blocked"],
+    "done": [],
+    "blocked": ["ready", "coding", "testing"],
+}
+
 DEFAULT_EXIT_CRITERIA: Dict[TaskStatus, str] = {
     "planned": "Module registered in tasks.jsonl with dependencies declared",
     "spec_ready": "Spec reviewed, contract frozen with required signatures listed",
@@ -111,7 +140,8 @@ class TaskEntry:
         """Parse a task entry from a dictionary."""
 
         status = data.get("status")
-        if status not in STATUS_ORDER:
+        # Accept both module-level and sub-task statuses
+        if status not in STATUS_ORDER and status not in SUB_STATUS_ORDER:
             raise ValueError(f"Invalid task status: {status!r}")
 
         depends_raw = data.get("depends_on", [])
@@ -217,17 +247,20 @@ class TaskLedger:
             created.append(entry)
         return created
 
-    def validate_transition(self, from_status: TaskStatus, to_status: TaskStatus) -> None:
-        """Validate a status transition."""
+    def validate_transition(self, from_status: str, to_status: str) -> None:
+        """Validate a status transition (module or sub-task)."""
 
         if from_status == to_status:
             return
-        allowed = ALLOWED_TRANSITIONS[from_status]
+        # Try module-level transitions first, then sub-task transitions
+        allowed = ALLOWED_TRANSITIONS.get(from_status) or SUB_ALLOWED_TRANSITIONS.get(from_status, [])
         if to_status in allowed:
             return
         if self.allow_skip_states:
-            if STATUS_ORDER.index(to_status) > STATUS_ORDER.index(from_status):
-                return
+            order = STATUS_ORDER if from_status in STATUS_ORDER else SUB_STATUS_ORDER
+            if from_status in order and to_status in order:
+                if order.index(to_status) > order.index(from_status):
+                    return
         raise ValueError(f"Invalid transition: {from_status} -> {to_status}")
 
     def update_status(self, task_id: str, new_status: TaskStatus) -> TaskEntry:
@@ -256,6 +289,7 @@ class TaskLedger:
             created_at=current.created_at,
             updated_at=utc_now_iso(),
             meta=current.meta,
+            parent_id=current.parent_id,
         )
         self.append(updated)
         return updated
@@ -299,6 +333,7 @@ class TaskLedger:
                 "block_reason": reason,
                 "blocked_at": now,
             },
+            parent_id=current.parent_id,
         )
         self.append(updated)
         return updated
@@ -323,6 +358,7 @@ class TaskLedger:
             created_at=current.created_at,
             updated_at=utc_now_iso(),
             meta=meta,
+            parent_id=current.parent_id,
         )
         self.append(updated)
         return updated
@@ -338,7 +374,7 @@ class TaskLedger:
         """Create file-level sub-tasks for a module.
 
         Each file dict: {id, title, depends_on: [file_ids]}.
-        Sub-tasks use a simplified state model: pending → coding → done.
+        Files with no intra-module deps start at 'ready'; others at 'planned'.
         """
 
         now = utc_now_iso()
@@ -355,14 +391,15 @@ class TaskLedger:
                 id=task_id,
                 module=module,
                 title=str(f.get("title", file_id)),
-                status="coding",
+                status="ready" if not full_deps else "planned",
                 depends_on=full_deps,
                 created_at=now,
                 updated_at=now,
                 meta={
                     "exit_criteria": {
                         "coding": f"Implement {file_id} according to spec",
-                        "done": "File passes unit tests and integrates with module",
+                        "testing": f"Unit tests for {file_id} pass",
+                        "done": "File passes review and integrates with module",
                     },
                 },
                 parent_id=module,
@@ -370,6 +407,48 @@ class TaskLedger:
             self.append(entry)
             created.append(entry)
         return created
+
+    def unlock_file_deps(self, module: str, completed_file_id: str) -> List[TaskEntry]:
+        """Auto-transition files whose dependencies are now all done.
+
+        When a file is marked done, scan other files in the same module
+        that are still 'planned' and whose deps are all satisfied → 'ready'.
+        """
+
+        latest = self.load_latest()
+        subs = self.sub_tasks(module)
+        unlocked: List[TaskEntry] = []
+        for t in subs:
+            if t.status != "planned":
+                continue
+            if self.is_ready(t, latest):
+                updated = TaskEntry(
+                    id=t.id, module=t.module, title=t.title,
+                    status="ready", depends_on=t.depends_on,
+                    created_at=t.created_at, updated_at=utc_now_iso(),
+                    meta=t.meta, parent_id=t.parent_id,
+                )
+                self.append(updated)
+                unlocked.append(updated)
+        return unlocked
+
+    def mark_file_testing(self, task_id: str) -> TaskEntry:
+        """Transition a file sub-task from coding to testing."""
+
+        latest = self.load_latest()
+        if task_id not in latest:
+            raise KeyError(f"Task id not found: {task_id}")
+        current = latest[task_id]
+        if current.status not in ("coding", "ready"):
+            raise ValueError(f"Cannot mark {current.status} as testing")
+        updated = TaskEntry(
+            id=current.id, module=current.module, title=current.title,
+            status="testing", depends_on=current.depends_on,
+            created_at=current.created_at, updated_at=utc_now_iso(),
+            meta=current.meta, parent_id=current.parent_id,
+        )
+        self.append(updated)
+        return updated
 
     def sub_tasks(self, module: str) -> List[TaskEntry]:
         """Return all sub-tasks for a module (latest snapshot)."""
@@ -383,17 +462,10 @@ class TaskLedger:
         ]
 
     def ready_sub_tasks(self, module: str) -> List[TaskEntry]:
-        """Return sub-tasks whose intra-module dependencies are met and not done."""
+        """Return sub-tasks explicitly in 'ready' state (deps met, awaiting worker)."""
 
-        latest = self.load_latest()
         subs = self.sub_tasks(module)
-        ready: List[TaskEntry] = []
-        for t in subs:
-            if t.status == "done":
-                continue
-            if self.is_ready(t, latest):
-                ready.append(t)
-        return ready
+        return [t for t in subs if t.status == "ready"]
 
     def all_sub_tasks_done(self, module: str) -> bool:
         """Check if all file-level sub-tasks for a module are done."""

@@ -1,9 +1,9 @@
 """
 tree-pipeline package.
 
-This package provides a minimal, type-safe implementation of a two-layer
+This package provides a minimal, type-safe implementation of a three-layer
 orchestration workflow for parallel module development driven by a DAG and a
-versioned contract.
+versioned contract (orchestrator → module agent → worker agents).
 """
 
 __all__ = ["Orchestrator"]

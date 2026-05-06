@@ -37,12 +37,13 @@ class DashboardGenerator:
         self.ledger = ledger
 
     def _stats(self, latest: Dict[str, TaskEntry]) -> DashboardStats:
-        total = len(latest)
-        done = sum(1 for t in latest.values() if t.status == "done")
-        in_progress = sum(1 for t in latest.values() if t.status not in ("planned", "done"))
+        mod_tasks = [t for t in latest.values() if not t.is_sub_task]
+        total = len(mod_tasks)
+        done = sum(1 for t in mod_tasks if t.status == "done")
+        in_progress = sum(1 for t in mod_tasks if t.status not in ("planned", "done"))
         blocked = sum(
             1
-            for t in latest.values()
+            for t in mod_tasks
             if t.status != "done" and not self.ledger.is_ready(t, latest)
         )
         return DashboardStats(total=total, done=done, in_progress=in_progress, blocked=blocked)
