@@ -21,7 +21,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .context_packet import ContextPacketBuilder, hard_truncate
 from .dashboard import DashboardGenerator
@@ -231,10 +231,11 @@ class Orchestrator:
             run_id=run_id, batches=batches, output_path=dash_path
         )
 
-    def validate(self, *, run_dir: str, project_root: str) -> List[str]:
+    def validate(self, *, run_dir: str, project_root: str, test_cmd: str | None = None) -> List[str]:
         """Run contract validation and optional test hooks.
 
         Returns a list of module names that failed validation (empty = all good).
+        If test_cmd is provided, runs it, parses results, and auto-updates task states.
         """
 
         contract_path = os.path.join(os.path.abspath(run_dir), self.config.contract_file_name)
@@ -263,6 +264,39 @@ class Orchestrator:
             "contract_path": contract_path,
         }
         runner = TestRunner()
+        ledger_path = os.path.join(run_dir, self.config.ledger_file_name)
+        ledger = TaskLedger(ledger_path, allow_skip_states=self.config.allow_skip_states)
+
+        # User-provided test command (e.g. npx vitest run)
+        if test_cmd:
+            print(f"[validate] Running: {test_cmd}")
+            res = runner.run(
+                command=test_cmd,
+                cwd=os.path.abspath(project_root),
+                variables=variables,
+            )
+            print(f"[validate] Exit code: {res.returncode}")
+
+            # Auto-update task states from test results
+            passed_modules = self._parse_vitest_modules(res.stdout)
+            latest = ledger.load_latest()
+            from .task_ledger import STATUS_ORDER
+            for mod in latest.values():
+                if mod.is_sub_task:
+                    continue
+                if mod.module in passed_modules and mod.status != "done":
+                    current_idx = STATUS_ORDER.index(mod.status)
+                    for target in STATUS_ORDER[current_idx + 1:]:
+                        try:
+                            ledger.update_status(mod.id, target)
+                            print(f"[validate] {mod.module}: {mod.status} -> {target}")
+                        except ValueError:
+                            continue
+
+            if not res.ok:
+                raise RuntimeError(
+                    "Tests failed:\n" + res.stdout[-2000:] + "\n" + res.stderr[-1000:]
+                )
 
         integ_cmd = self.config.commands.get("integration_tests")
         if integ_cmd:
@@ -285,6 +319,14 @@ class Orchestrator:
             )
             if not res.ok:
                 raise RuntimeError("CDC tests failed:\n" + res.stdout + "\n" + res.stderr)
+
+        # Update dashboard after validation
+        dash_path = os.path.join(run_dir, self.config.dashboard_file_name)
+        DashboardGenerator(ledger).render(
+            run_id=os.path.basename(os.path.abspath(run_dir)),
+            batches=[],
+            output_path=dash_path,
+        )
 
         return failed_modules
 
@@ -375,6 +417,21 @@ class Orchestrator:
             mod = m.group(1)
             if mod not in modules:
                 modules.append(mod)
+        return modules
+
+    @staticmethod
+    def _parse_vitest_modules(stdout: str) -> set[str]:
+        """Parse vitest output to find which modules had passing tests.
+        
+        Looks for patterns like: ✓ tests/core-engine/ecs.test.ts (12 tests)
+        Extracts the module directory name from the test path.
+        """
+        import re
+        
+        modules: set[str] = set()
+        # Match vitest checkmarks: ✓ tests/module-name/file.test.ts
+        for m in re.finditer(r'✓\s+tests/([^/]+)/', stdout):
+            modules.add(m.group(1))
         return modules
 
     def _write_spec_and_conventions(
@@ -487,15 +544,34 @@ class Orchestrator:
 
         lock_excerpt = self._try_read_lock_excerpt(project_root)
         for module in modules:
-            # In this simplified implementation we reuse full documents and rely on truncation.
+            # Extract module-specific contract section instead of full dump
+            module_contract = self._extract_module_contract(contract_text, module)
+            module_spec = self._extract_module_spec(spec_text, module)
             packet = builder.build(
                 module=module,
-                contract_excerpt=contract_text,
-                spec_excerpt=spec_text,
+                contract_excerpt=module_contract or contract_text,
+                spec_excerpt=module_spec or spec_text,
                 conventions_excerpt=conv_text,
                 lock_excerpt=lock_excerpt,
             )
             write_text(os.path.join(packets_dir, f"{module}.md"), packet.content)
+
+    @staticmethod
+    def _extract_module_contract(contract_text: str, module: str) -> str | None:
+        """Extract the section of contract.yaml relevant to a specific module."""
+        import re
+        # Match from "  - name: module" to the next "  - name:" or end of modules
+        pattern = rf'(  - name: "{re.escape(module)}".*?)(?=\n  - name: |\nmodules:|\Z)'
+        m = re.search(pattern, contract_text, re.DOTALL)
+        return m.group(1) if m else None
+
+    @staticmethod
+    def _extract_module_spec(spec_text: str, module: str) -> str | None:
+        """Extract the module line from spec.md."""
+        import re
+        pattern = rf'- `{re.escape(module)}`:.*'
+        m = re.search(pattern, spec_text)
+        return m.group(0) if m else None
 
     def _try_read_lock_excerpt(self, project_root: str) -> str:
         candidates = [
@@ -592,21 +668,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_start.add_argument("--run-dir", required=True)
     p_start.add_argument("--templates-dir", default=None)
     p_start.add_argument("--module", action="append", default=[])
-    p_start.add_argument("--edge", action="append", default=[])
+    p_start.add_argument(
+        "--edge", action="append", default=[],
+        help="Dependency edge: DEPENDENT:DEPENDENCY (e.g. room-system:core-engine means room-system depends on core-engine)",
+    )
 
     p_status = sub.add_parser("status", help="Render dashboard for an existing run")
     p_status.add_argument("--run-dir", required=True)
     p_status.add_argument("--module", action="append", default=[])
-    p_status.add_argument("--edge", action="append", default=[])
+    p_status.add_argument(
+        "--edge", action="append", default=[],
+        help="Dependency edge: DEPENDENT:DEPENDENCY",
+    )
 
     p_resume = sub.add_parser("resume", help="Alias for status (safe resume)")
     p_resume.add_argument("--run-dir", required=True)
     p_resume.add_argument("--module", action="append", default=[])
-    p_resume.add_argument("--edge", action="append", default=[])
+    p_resume.add_argument(
+        "--edge", action="append", default=[],
+        help="Dependency edge: DEPENDENT:DEPENDENCY",
+    )
 
     p_validate = sub.add_parser("validate", help="Validate contract + run test hooks")
     p_validate.add_argument("--run-dir", required=True)
     p_validate.add_argument("--project-root", required=True)
+    p_validate.add_argument("--test-cmd", default=None, help="Test command to run and parse results from")
 
     p_dispatch = sub.add_parser("dispatch", help="Dispatch file-level tasks to worker agents")
     p_dispatch.add_argument("--run-dir", required=True)
@@ -625,6 +711,37 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "start":
         modules = _parse_modules(args.module)
         edges = edges_from_strings(args.edge)
+
+        # Auto-read modules/edges from YAML config if not passed via CLI
+        if not modules:
+            cfg_modules = deep_get(config, "modules", None)
+            if cfg_modules and isinstance(cfg_modules, list):
+                for m in cfg_modules:
+                    if isinstance(m, dict):
+                        name = m.get("name", "")
+                        if name:
+                            modules.append(name)
+                    elif isinstance(m, str):
+                        modules.append(m)
+        if not edges:
+            # Read edges from config: each module dict has depends_on list
+            cfg_modules = deep_get(config, "modules", None)
+            if cfg_modules and isinstance(cfg_modules, list):
+                edge_strs = []
+                for m in cfg_modules:
+                    if isinstance(m, dict):
+                        name = m.get("name", "")
+                        deps = m.get("depends_on", [])
+                        if name and isinstance(deps, list):
+                            for dep in deps:
+                                edge_strs.append(f"{name}:{dep}")
+                edges = edges_from_strings(edge_strs)
+
+        if not modules:
+            raise ValueError(
+                "No modules specified. Use --module or define 'modules' in YAML config."
+            )
+
         templates_dir = _resolve_templates_dir(args.templates_dir)
         orch.start(
             project_root=args.project_root,
@@ -639,11 +756,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         modules = _parse_modules(args.module)
         edge_strs: List[str] = list(args.edge)
         batches = _infer_batches_from_edges(modules, edge_strs) if modules else []
-        orch.status(run_dir=args.run_dir, batches=batches)
+        print(orch.status(run_dir=args.run_dir, batches=batches))
         return 0
 
     if args.cmd == "validate":
-        orch.validate(run_dir=args.run_dir, project_root=args.project_root)
+        failed = orch.validate(
+            run_dir=args.run_dir,
+            project_root=args.project_root,
+            test_cmd=getattr(args, 'test_cmd', None),
+        )
+        if failed:
+            print(f"Validation failed for modules: {', '.join(failed)}")
+        else:
+            print("Validation passed")
         return 0
 
     if args.cmd == "dispatch":
