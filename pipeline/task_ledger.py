@@ -215,6 +215,7 @@ class TaskLedger:
         *,
         modules: Sequence[str],
         dependencies: Dict[str, List[str]],
+        task_meta_by_module: Optional[Dict[str, Dict[str, object]]] = None,
         title_template: str = "Implement module {module}",
     ) -> List[TaskEntry]:
         """
@@ -241,7 +242,10 @@ class TaskLedger:
                 depends_on=dependencies.get(module, []),
                 created_at=now,
                 updated_at=now,
-                meta={"exit_criteria": dict(DEFAULT_EXIT_CRITERIA)},
+                meta={
+                    "exit_criteria": dict(DEFAULT_EXIT_CRITERIA),
+                    **(task_meta_by_module or {}).get(module, {}),
+                },
             )
             self.append(entry)
             created.append(entry)
@@ -358,6 +362,27 @@ class TaskLedger:
             created_at=current.created_at,
             updated_at=utc_now_iso(),
             meta=meta,
+            parent_id=current.parent_id,
+        )
+        self.append(updated)
+        return updated
+
+    def update_meta(self, task_id: str, updates: Dict[str, object]) -> TaskEntry:
+        """Merge metadata updates into a task and append a new snapshot."""
+
+        latest = self.load_latest()
+        if task_id not in latest:
+            raise KeyError(f"Task id not found: {task_id}")
+        current = latest[task_id]
+        updated = TaskEntry(
+            id=current.id,
+            module=current.module,
+            title=current.title,
+            status=current.status,
+            depends_on=current.depends_on,
+            created_at=current.created_at,
+            updated_at=utc_now_iso(),
+            meta={**current.meta, **updates},
             parent_id=current.parent_id,
         )
         self.append(updated)
@@ -491,4 +516,3 @@ class TaskLedger:
                 ready.append(task)
         ready.sort(key=lambda t: (STATUS_ORDER.index(t.status), t.module))
         return ready
-

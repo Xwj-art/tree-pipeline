@@ -326,6 +326,26 @@ class GitManager:
             changed=True, message=f"Created and pushed {branch}", branch=info
         )
 
+    def checkout_branch(self, branch: str) -> GitOperationResult:
+        """Switch to a branch safely, reusing the current branch when possible."""
+
+        current = self.current_branch()
+        if current == branch:
+            return GitOperationResult(changed=False, message=f"Already on {branch}")
+
+        clean = self.ensure_clean_for_checkout()
+        if not clean.ok:
+            return clean
+
+        r = _run(["git", "switch", branch], cwd=self.repo_root)
+        if r.returncode != 0:
+            return GitOperationResult(
+                changed=False,
+                message=f"Failed to switch to {branch}",
+                errors=[r.stderr],
+            )
+        return GitOperationResult(changed=True, message=f"Switched to {branch}")
+
     def push_branch(self, *, branch: Optional[str] = None, set_upstream: bool = True) -> GitOperationResult:
         """Push current or named branch to remote."""
         target = branch or self.current_branch()

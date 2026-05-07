@@ -10,3 +10,8 @@ venv/
 *.swp
 *.swo
 AGENTS.md
+
+# Intermediate analysis snapshots — never commit
+*_REVIEW.md
+*_PLAN.md
+*_ANALYSIS.md

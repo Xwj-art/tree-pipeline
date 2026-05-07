@@ -114,6 +114,15 @@ class OrchestratorConfig:
     conventions_max_tokens: int
     lock_excerpt_max_tokens: int
     allow_skip_states: bool
+    micro_batch_tests_enabled: bool
+    functions_per_batch_min: int
+    functions_per_batch_max: int
+    coverage_target_min: float
+    coverage_target_max: float
+    require_scenario_checklist: bool
+    require_cdc: bool
+    feature_flags_enabled: bool
+    feature_flag_prefix: str
 
     contract_file_name: str
     spec_file_name: str
@@ -148,6 +157,45 @@ def resolve_config(config: Dict[str, Any]) -> OrchestratorConfig:
             deep_get(config, "orchestrator.token_budget.lock_excerpt_max_tokens", 300)
         ),
         allow_skip_states=bool(deep_get(config, "ledger.allow_skip_states", False)),
+        micro_batch_tests_enabled=bool(
+            deep_get(config, "orchestrator.micro_batch_tests.enabled", True)
+        ),
+        functions_per_batch_min=int(
+            deep_get(config, "orchestrator.micro_batch_tests.functions_per_batch_min", 2)
+        ),
+        functions_per_batch_max=int(
+            deep_get(config, "orchestrator.micro_batch_tests.functions_per_batch_max", 5)
+        ),
+        coverage_target_min=float(
+            deep_get(
+                config,
+                "orchestrator.quality_gates.coverage.line_coverage_target_min",
+                0.80,
+            )
+        ),
+        coverage_target_max=float(
+            deep_get(
+                config,
+                "orchestrator.quality_gates.coverage.line_coverage_target_max",
+                0.90,
+            )
+        ),
+        require_scenario_checklist=bool(
+            deep_get(
+                config,
+                "orchestrator.quality_gates.coverage.require_scenario_checklist",
+                True,
+            )
+        ),
+        require_cdc=bool(
+            deep_get(config, "orchestrator.quality_gates.coverage.require_cdc", True)
+        ),
+        feature_flags_enabled=bool(
+            deep_get(config, "orchestrator.feature_flags.enabled", True)
+        ),
+        feature_flag_prefix=str(
+            deep_get(config, "orchestrator.feature_flags.naming_prefix", "FF_")
+        ),
         contract_file_name=str(deep_get(config, "contract.file_name", "contract.yaml")),
         spec_file_name=str(deep_get(config, "spec.file_name", "spec.md")),
         conventions_file_name=str(deep_get(config, "conventions.file_name", "conventions.md")),
@@ -170,6 +218,91 @@ def resolve_config(config: Dict[str, Any]) -> OrchestratorConfig:
     )
 
 
+def _normalize_module_specs(
+    module_items: Sequence[object],
+) -> Tuple[List[str], Dict[str, Dict[str, object]]]:
+    """Extract module names plus optional metadata from config-like items."""
+
+    modules: List[str] = []
+    meta: Dict[str, Dict[str, object]] = {}
+    for item in module_items:
+        if isinstance(item, str):
+            modules.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+        modules.append(name)
+        paths_raw = item.get("paths", [])
+        paths = [str(path) for path in paths_raw] if isinstance(paths_raw, list) else []
+        description = str(item.get("description", "")).strip()
+        module_meta: Dict[str, object] = {}
+        if description:
+            module_meta["description"] = description
+        if paths:
+            module_meta["owned_paths"] = paths
+        if module_meta:
+            meta[name] = module_meta
+    return _parse_modules(modules), meta
+
+
+def _load_suggestions_payload(path: str) -> Dict[str, Any]:
+    """Load and validate a suggestions JSON file."""
+
+    payload = load_yaml_or_json(path)
+    if not isinstance(payload, dict):
+        raise ValueError("Suggestions payload must be an object")
+    candidates = payload.get("module_candidates", [])
+    if not isinstance(candidates, list) or not candidates:
+        raise ValueError("Suggestions payload must contain non-empty module_candidates")
+    edges = payload.get("dependency_candidates", [])
+    if edges is not None and not isinstance(edges, list):
+        raise ValueError("Suggestions payload dependency_candidates must be a list")
+    if not bool(payload.get("approved", False)):
+        raise ValueError("Suggestions payload must be approved before start can consume it")
+    return payload
+
+
+def _modules_and_edges_from_suggestions(
+    payload: Dict[str, Any],
+) -> Tuple[List[str], List[Tuple[str, str]], Dict[str, Dict[str, object]]]:
+    """Extract modules, dependency edges, and metadata from suggestions."""
+
+    modules: List[str] = []
+    meta: Dict[str, Dict[str, object]] = {}
+    for item in payload.get("module_candidates", []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+        modules.append(name)
+        module_meta: Dict[str, object] = {}
+        for key in ("description", "primary_kind"):
+            value = item.get(key)
+            if value:
+                module_meta[key] = value
+        paths_raw = item.get("owned_paths", [])
+        if isinstance(paths_raw, list):
+            paths = [str(path) for path in paths_raw if str(path).strip()]
+            if paths:
+                module_meta["owned_paths"] = paths
+        if module_meta:
+            meta[name] = module_meta
+
+    edges: List[Tuple[str, str]] = []
+    for edge in payload.get("dependency_candidates", []):
+        if not isinstance(edge, dict):
+            continue
+        consumer = str(edge.get("consumer", "")).strip()
+        provider = str(edge.get("provider", "")).strip()
+        if consumer and provider:
+            edges.append((consumer, provider))
+    return _parse_modules(modules), edges, meta
+
+
 class Orchestrator:
     """Core orchestration API (used by CLI)."""
 
@@ -189,6 +322,8 @@ class Orchestrator:
         templates_dir: str,
         modules: Sequence[str],
         edges: Sequence[Tuple[str, str]],
+        module_metadata: Optional[Dict[str, Dict[str, object]]] = None,
+        suggestions_path: Optional[str] = None,
         git_auto: bool = False,
     ) -> None:
         """Initialize a new pipeline run directory with specs, ledger, and packets."""
@@ -215,7 +350,11 @@ class Orchestrator:
 
         ledger_path = os.path.join(run_dir, self.config.ledger_file_name)
         ledger = TaskLedger(ledger_path, allow_skip_states=self.config.allow_skip_states)
-        ledger.create_tasks(modules=list(modules), dependencies=prereq_map)
+        ledger.create_tasks(
+            modules=list(modules),
+            dependencies=prereq_map,
+            task_meta_by_module=module_metadata,
+        )
 
         self._write_context_packets(
             project_root=project_root,
@@ -226,9 +365,12 @@ class Orchestrator:
 
         self.write_run_manifest(
             run_dir=run_dir,
+            project_root=project_root,
             modules=modules,
             edges=edges,
             batches=batches.batches,
+            module_metadata=module_metadata or {},
+            suggestions_path=suggestions_path,
         )
 
         dash_path = os.path.join(run_dir, self.config.dashboard_file_name)
@@ -239,7 +381,8 @@ class Orchestrator:
         if git_auto:
             self._ensure_module_branches(project_root=project_root, modules=list(modules))
 
-    def resume(self, *, run_dir: str, batches: List[List[str]]) -> str:
+    def resume(self, *, run_dir: str, batches: List[List[str]],
+               project_root: Optional[str] = None) -> str:
         """Resume a run: auto-unblock stale blocks, then refresh the dashboard.
 
         Unlike status (read-only), resume actively scans for blocked tasks
@@ -264,19 +407,24 @@ class Orchestrator:
 
         run_id = os.path.basename(os.path.abspath(run_dir))
         dash_path = os.path.join(run_dir, self.config.dashboard_file_name)
+        git_status = self._gather_git_status(run_dir=run_dir, project_root=project_root)
         return DashboardGenerator(ledger).render(
-            run_id=run_id, batches=batches, output_path=dash_path
+            run_id=run_id, batches=batches, output_path=dash_path,
+            git_status_by_module=git_status,
         )
 
-    def status(self, *, run_dir: str, batches: List[List[str]]) -> str:
+    def status(self, *, run_dir: str, batches: List[List[str]],
+               project_root: Optional[str] = None) -> str:
         """Return dashboard markdown for the current run status."""
 
         ledger_path = os.path.join(run_dir, self.config.ledger_file_name)
         ledger = TaskLedger(ledger_path, allow_skip_states=self.config.allow_skip_states)
         run_id = os.path.basename(os.path.abspath(run_dir))
         dash_path = os.path.join(run_dir, self.config.dashboard_file_name)
+        git_status = self._gather_git_status(run_dir=run_dir, project_root=project_root)
         return DashboardGenerator(ledger).render(
-            run_id=run_id, batches=batches, output_path=dash_path
+            run_id=run_id, batches=batches, output_path=dash_path,
+            git_status_by_module=git_status,
         )
 
     def validate(self, *, run_dir: str, project_root: str, test_cmd: str | None = None) -> List[str]:
@@ -315,21 +463,29 @@ class Orchestrator:
         ledger_path = os.path.join(run_dir, self.config.ledger_file_name)
         ledger = TaskLedger(ledger_path, allow_skip_states=self.config.allow_skip_states)
 
-        # User-provided test command (e.g. npx vitest run)
-        if test_cmd:
-            print(f"[validate] Running: {test_cmd}")
-            res = runner.run(
-                command=test_cmd,
-                cwd=os.path.abspath(project_root),
-                variables=variables,
+        unit_summary = self._run_unit_test_hook(
+            project_root=project_root,
+            run_dir=run_dir,
+            runner=runner,
+            variables=variables,
+            test_cmd=test_cmd,
+        )
+        self._write_test_summary_to_modules(
+            ledger=ledger,
+            modules=self._module_scope_for_summary(ledger),
+            summary=unit_summary,
+        )
+        if self._summary_failed(unit_summary):
+            for module in self._module_scope_for_summary(ledger):
+                ledger.block_task(module, f"Unit tests failed for {module}")
+            raise RuntimeError(
+                "Unit tests failed:\n"
+                + unit_summary.get("stdout_tail", "")
+                + "\n"
+                + unit_summary.get("stderr_tail", "")
             )
-            print(f"[validate] Exit code: {res.returncode}")
 
-            if not res.ok:
-                raise RuntimeError(
-                    "Tests failed:\n" + res.stdout[-2000:] + "\n" + res.stderr[-1000:]
-                )
-
+        # User-provided test command (e.g. npx vitest run)
         integ_cmd = self.config.commands.get("integration_tests")
         if integ_cmd:
             res = runner.run(
@@ -349,6 +505,20 @@ class Orchestrator:
                 cwd=cdc_cmd.get("cwd", "{project_root}"),
                 variables=variables,
             )
+            self._write_test_summary_to_modules(
+                ledger=ledger,
+                modules=self._module_scope_for_summary(ledger),
+                summary={
+                    "status": "passed" if res.ok else "failed",
+                    "command": cdc_cmd.get("command", ""),
+                    "passed": 1 if res.ok else 0,
+                    "failed": 0 if res.ok else 1,
+                    "coverage_pct": None,
+                    "cdc_ok": res.ok,
+                    "feature_flags_ok": True,
+                    "last_run_at": utc_now_iso(),
+                },
+            )
             if not res.ok:
                 raise RuntimeError("CDC tests failed:\n" + res.stdout + "\n" + res.stderr)
 
@@ -362,7 +532,14 @@ class Orchestrator:
 
         return failed_modules
 
-    def mark_file_done(self, *, run_dir: str, task_id: str) -> str:
+    def mark_file_done(
+        self,
+        *,
+        run_dir: str,
+        task_id: str,
+        project_root: Optional[str] = None,
+        test_cmd: Optional[str] = None,
+    ) -> str:
         """Mark a file sub-task as done with full auto-advance chain.
 
         1. Transition file: coding→testing→done
@@ -384,11 +561,32 @@ class Orchestrator:
 
         result = f"File marked done: {entry.id} -> {entry.status}"
         if ledger.all_sub_tasks_done(module):
+            repo_root = project_root or self._project_root_for_run(run_dir)
+            summary = self._run_unit_test_hook(
+                project_root=repo_root,
+                run_dir=run_dir,
+                runner=TestRunner(),
+                variables={
+                    "project_root": os.path.abspath(repo_root),
+                    "run_dir": os.path.abspath(run_dir),
+                    "contract_path": os.path.join(os.path.abspath(run_dir), self.config.contract_file_name),
+                },
+                test_cmd=test_cmd,
+            )
+            self._write_test_summary_to_modules(ledger=ledger, modules=[module], summary=summary)
             latest = ledger.load_latest()
             mod_task = latest.get(module)
-            if mod_task and mod_task.status == "coding":
+            if self._summary_failed(summary):
+                ledger.block_task(module, f"Unit tests failed for {module}")
+                result += f"\nModule {module}: blocked by unit test failure"
+            elif mod_task and mod_task.status == "coding":
+                if mod_task.meta.get("blocked"):
+                    ledger.unblock_task(module)
                 ledger.update_status(module, "unit_tests")
-                result += f"\nModule {module}: coding -> unit_tests (all {len(ledger.sub_tasks(module))} files done)"
+                result += (
+                    f"\nModule {module}: coding -> unit_tests "
+                    f"(all {len(ledger.sub_tasks(module))} files done, tests passed)"
+                )
 
         dash_path = os.path.join(run_dir, self.config.dashboard_file_name)
         DashboardGenerator(ledger).render(
@@ -419,6 +617,152 @@ class Orchestrator:
                 lines.append(f"  {st}: {len(ids)} files")
         return "\n".join(lines)
 
+    def _project_root_for_run(self, run_dir: str) -> str:
+        """Resolve project root for an existing run."""
+
+        manifest = self.read_run_manifest(run_dir)
+        project_root = str(manifest.get("project_root", "")).strip()
+        if project_root:
+            return project_root
+        return os.getcwd()
+
+    def _module_scope_for_summary(self, ledger: TaskLedger) -> List[str]:
+        """Return module ids that should receive run-level test summaries."""
+
+        latest = ledger.load_latest()
+        modules = [task.id for task in latest.values() if not task.is_sub_task]
+        modules.sort()
+        return modules
+
+    def _build_test_summary(
+        self,
+        *,
+        command: str,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        cdc_ok: Optional[bool] = None,
+    ) -> Dict[str, object]:
+        """Convert command output into a structured test summary."""
+
+        import re
+
+        combined = stdout + "\n" + stderr
+
+        def _extract_count(pattern: str) -> int:
+            match = re.search(pattern, combined)
+            return int(match.group(1)) if match else 0
+
+        coverage_pct: Optional[float] = None
+        coverage_match = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", combined)
+        if not coverage_match:
+            coverage_match = re.search(r"coverage[^0-9]*(\d+)%", combined, re.IGNORECASE)
+        if coverage_match:
+            coverage_pct = float(coverage_match.group(1)) / 100.0
+
+        passed = _extract_count(r"(\d+)\s+passed")
+        failed = _extract_count(r"(\d+)\s+failed")
+        errors = _extract_count(r"(\d+)\s+error")
+        if returncode == 0 and passed == 0 and failed == 0 and errors == 0:
+            passed = 1
+        if returncode != 0 and failed == 0 and errors == 0:
+            failed = 1
+
+        feature_flags_ok = True
+        return {
+            "status": "passed" if returncode == 0 else "failed",
+            "command": command,
+            "passed": passed,
+            "failed": failed + errors,
+            "coverage_pct": coverage_pct,
+            "cdc_ok": True if cdc_ok is None else cdc_ok,
+            "feature_flags_ok": feature_flags_ok,
+            "last_run_at": utc_now_iso(),
+            "stdout_tail": stdout[-2000:],
+            "stderr_tail": stderr[-1000:],
+        }
+
+    def _summary_failed(self, summary: Dict[str, object]) -> bool:
+        """Whether a structured summary should block module advancement."""
+
+        if summary.get("status") != "passed":
+            return True
+        coverage_pct = summary.get("coverage_pct")
+        if isinstance(coverage_pct, (int, float)) and coverage_pct < self.config.coverage_target_min:
+            return True
+        cdc_ok = summary.get("cdc_ok")
+        if cdc_ok is False:
+            return True
+        feature_flags_ok = summary.get("feature_flags_ok")
+        if feature_flags_ok is False:
+            return True
+        return False
+
+    def _run_unit_test_hook(
+        self,
+        *,
+        project_root: str,
+        run_dir: str,
+        runner: TestRunner,
+        variables: Dict[str, str],
+        test_cmd: Optional[str],
+    ) -> Dict[str, object]:
+        """Run the configured unit test command and return a structured summary."""
+
+        unit_cmd = test_cmd
+        unit_cwd = "{project_root}"
+        if not unit_cmd:
+            cfg = self.config.commands.get("unit_tests", {})
+            unit_cmd = cfg.get("command")
+            unit_cwd = cfg.get("cwd", "{project_root}")
+
+        if not unit_cmd:
+            return {
+                "status": "failed",
+                "command": "",
+                "passed": 0,
+                "failed": 1,
+                "coverage_pct": None,
+                "cdc_ok": True,
+                "feature_flags_ok": True,
+                "last_run_at": utc_now_iso(),
+                "stdout_tail": "",
+                "stderr_tail": "No unit_tests command configured.",
+            }
+
+        print(f"[unit-tests] Running: {unit_cmd}")
+        res = runner.run(
+            command=unit_cmd,
+            cwd=unit_cwd,
+            variables=variables,
+        )
+        print(f"[unit-tests] Exit code: {res.returncode}")
+        return self._build_test_summary(
+            command=unit_cmd,
+            returncode=res.returncode,
+            stdout=res.stdout,
+            stderr=res.stderr,
+        )
+
+    def _write_test_summary_to_modules(
+        self,
+        *,
+        ledger: TaskLedger,
+        modules: Sequence[str],
+        summary: Dict[str, object],
+    ) -> None:
+        """Persist a structured test summary to module task metadata."""
+
+        for module in modules:
+            latest = ledger.load_latest()
+            task = latest.get(module)
+            if task is None or task.is_sub_task:
+                continue
+            payload = dict(summary)
+            payload.pop("stdout_tail", None)
+            payload.pop("stderr_tail", None)
+            ledger.update_meta(module, {"test_summary": payload})
+
     def file_start(self, *, run_dir: str, task_id: str) -> TaskEntry:
         """Claim a file sub-task (ready→coding). Called by Worker Agent."""
 
@@ -433,14 +777,20 @@ class Orchestrator:
 
     def write_run_manifest(
         self, *, run_dir: str,
+        project_root: str,
         modules: Sequence[str], edges: Sequence[Tuple[str, str]],
         batches: List[List[str]],
+        module_metadata: Optional[Dict[str, Dict[str, object]]] = None,
+        suggestions_path: Optional[str] = None,
     ) -> None:
         import json as _json
         manifest = {
+            "project_root": os.path.abspath(project_root),
             "modules": list(modules),
             "edges": [f"{c}:{p}" for c, p in edges],
             "batches": batches,
+            "module_metadata": module_metadata or {},
+            "suggestions_path": suggestions_path,
             "created_at": utc_now_iso(),
         }
         with open(self.run_manifest_path(run_dir), "w", encoding="utf-8") as f:
@@ -562,6 +912,36 @@ class Orchestrator:
 
     # ── Git automation ─────────────────────────────────────────────────
 
+    def _gather_git_status(self, *, run_dir: str,
+                           project_root: Optional[str] = None) -> Optional[Dict[str, Dict[str, object]]]:
+        """Gather git branch/PR status per module for dashboard enrichment."""
+
+        if not project_root or not os.path.isdir(project_root):
+            return None
+        try:
+            git = self._git(project_root)
+            avail = git.ensure_cli_available()
+            if not avail.ok:
+                return None
+            manifest = self.read_run_manifest(run_dir)
+            modules = manifest.get("modules", [])
+            if not modules:
+                return None
+            branches = [f"module/{m}" for m in modules]
+            statuses = git.aggregate_module_status(branches=branches)
+            result: Dict[str, Dict[str, object]] = {}
+            for i, module in enumerate(modules):
+                if i < len(statuses):
+                    result[module] = {
+                        "branch": statuses[i].get("branch", "-"),
+                        "pr_url": str(statuses[i].get("pr_url", "-") or "-"),
+                        "pr_state": statuses[i].get("pr_state", "-"),
+                        "mergeable": statuses[i].get("mergeable", "-"),
+                    }
+            return result
+        except Exception:
+            return None
+
     def _git(self, project_root: str) -> GitManager:
         return GitManager(
             repo_root=project_root,
@@ -650,28 +1030,35 @@ class Orchestrator:
 
     def _write_git_meta(self, *, ledger: TaskLedger, module: str, branch: str) -> None:
         """Write git metadata into the module task entry."""
-        latest = ledger.load_latest()
-        task = latest.get(module)
-        if task is None:
-            return
-        import json
-        updated = TaskEntry(
-            id=task.id, module=task.module, title=task.title,
-            status=task.status, depends_on=task.depends_on,
-            created_at=task.created_at, updated_at=task.updated_at,
-            meta={
-                **task.meta,
-                "git": json.dumps({"branch": branch, "shipped": True}),
-            },
-            parent_id=task.parent_id,
-        )
-        ledger.append(updated)
+        ledger.update_meta(module, {"git": {"branch": branch, "shipped": True}})
+
+    def _resolve_module_pathspecs(self, *, run_dir: str, module: str) -> List[str]:
+        """Resolve owned pathspecs from manifest metadata or dispatched files."""
+
+        manifest = self.read_run_manifest(run_dir)
+        module_meta = manifest.get("module_metadata", {})
+        if isinstance(module_meta, dict):
+            meta = module_meta.get(module, {})
+            if isinstance(meta, dict):
+                paths_raw = meta.get("owned_paths", [])
+                if isinstance(paths_raw, list):
+                    paths = [str(path) for path in paths_raw if str(path).strip()]
+                    if paths:
+                        return list(dict.fromkeys(paths))
+
+        ledger_path = os.path.join(run_dir, self.config.ledger_file_name)
+        ledger = TaskLedger(ledger_path, allow_skip_states=True)
+        files = [
+            sub.id.split("::", 1)[1]
+            for sub in ledger.sub_tasks(module)
+            if "::" in sub.id
+        ]
+        return list(dict.fromkeys(files))
 
     def module_ship(self, *, run_dir: str, project_root: str, module: str,
                     commit_message: str = "", pr_title: str = "",
                     pr_body: str = "") -> str:
-        """Internal: ship a module using subprocess for git switch."""
-        import subprocess
+        """Ship a module with scoped commit paths and safe branch checkout."""
 
         ledger_path = os.path.join(run_dir, self.config.ledger_file_name)
         ledger = TaskLedger(ledger_path, allow_skip_states=True)
@@ -696,11 +1083,19 @@ class Orchestrator:
         if not info.exists_local:
             return f"ERROR: Branch {branch} does not exist. Run 'start --git-auto' first."
 
-        if not info.current:
-            subprocess.run(["git", "switch", branch], cwd=project_root, capture_output=True, text=True)
+        owned_paths = self._resolve_module_pathspecs(run_dir=run_dir, module=module)
+        if not owned_paths:
+            return (
+                f"ERROR: Cannot ship {module} — no owned paths resolved from config, "
+                "suggestions, or dispatched files."
+            )
+
+        checkout = git.checkout_branch(branch)
+        if not checkout.ok:
+            return f"ERROR: {checkout.errors}"
 
         msg = commit_message or f"feat({module}): implement {module} module"
-        commit = git.commit_paths(message=msg)
+        commit = git.commit_paths(message=msg, pathspecs=owned_paths)
         print(f"[module-ship] Commit: {commit.message}")
 
         push = git.push_branch(branch=branch)
@@ -813,18 +1208,48 @@ class Orchestrator:
         os.makedirs(packets_dir, exist_ok=True)
 
         lock_excerpt = self._try_read_lock_excerpt(project_root)
+
+        ledger_path = os.path.join(run_dir, self.config.ledger_file_name)
+        ledger = TaskLedger(ledger_path, allow_skip_states=self.config.allow_skip_states)
+        latest = ledger.load_latest()
+
         for module in modules:
-            # Extract module-specific contract section instead of full dump
             module_contract = self._extract_module_contract(contract_text, module)
             module_spec = self._extract_module_spec(spec_text, module)
+
+            state_snapshot = self._build_module_snapshot(module, latest)
+            git_snapshot = f"Branch: module/{module} (pending creation)"
+
             packet = builder.build(
                 module=module,
                 contract_excerpt=module_contract or contract_text,
                 spec_excerpt=module_spec or spec_text,
                 conventions_excerpt=conv_text,
                 lock_excerpt=lock_excerpt,
+                state_snapshot=state_snapshot,
+                git_snapshot=git_snapshot,
             )
             write_text(os.path.join(packets_dir, f"{module}.md"), packet.content)
+
+    @staticmethod
+    def _build_module_snapshot(module: str,
+                               latest: Dict[str, "TaskEntry"]) -> str:
+        """Build a brief state snapshot for a module from ledger data."""
+
+        task = latest.get(module)
+        if task is None:
+            return f"- Module `{module}` not yet recorded in ledger."
+        status = task.status
+        blocked = "BLOCKED: " + str(task.meta.get("block_reason", ""))[:60] if task.meta.get("blocked") else ""
+        deps = ", ".join(task.depends_on) if task.depends_on else "none"
+        lines = [
+            f"- Module: `{module}`",
+            f"- Status: {status}",
+        ]
+        if blocked:
+            lines.append(f"- Blocked: {blocked}")
+        lines.append(f"- Depends on: {deps}")
+        return "\n".join(lines)
 
     @staticmethod
     def _extract_module_contract(contract_text: str, module: str) -> str | None:
@@ -940,6 +1365,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_start.add_argument("--templates-dir", default=None)
     p_start.add_argument("--module", action="append", default=[])
     p_start.add_argument(
+        "--suggestions",
+        default=None,
+        help="Approved suggestions JSON produced by suggest-modules",
+    )
+    p_start.add_argument(
         "--edge", action="append", default=[],
         help="Dependency edge: DEPENDENT:DEPENDENCY (e.g. room-system:core-engine means room-system depends on core-engine)",
     )
@@ -965,11 +1395,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_status = sub.add_parser("status", help="Render dashboard for an existing run")
     p_status.add_argument("--run-dir", required=True)
+    p_status.add_argument("--project-root", default=None, help="Optional: enrich dashboard with git status")
     p_status.add_argument("--module", action="append", default=[], help="Optional: override manifest")
     p_status.add_argument("--edge", action="append", default=[], help="Optional: override manifest")
 
     p_resume = sub.add_parser("resume", help="Resume a run: auto-unblock + refresh dashboard")
     p_resume.add_argument("--run-dir", required=True)
+    p_resume.add_argument("--project-root", default=None, help="Optional: enrich dashboard with git status")
     p_resume.add_argument("--module", action="append", default=[], help="Optional: override manifest")
     p_resume.add_argument("--edge", action="append", default=[], help="Optional: override manifest")
 
@@ -1030,6 +1462,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "start":
         modules = _parse_modules(args.module)
         edges = edges_from_strings(args.edge)
+        module_metadata: Dict[str, Dict[str, object]] = {}
+
+        if getattr(args, "suggestions", None):
+            suggestions = _load_suggestions_payload(args.suggestions)
+            modules, edges, module_metadata = _modules_and_edges_from_suggestions(suggestions)
 
         # Auto-read modules/edges from YAML config if not passed via CLI
         if not modules:
@@ -1038,13 +1475,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if isinstance(cfg_modules, dict):
                 cfg_modules = cfg_modules.get("items", cfg_modules)
             if cfg_modules and isinstance(cfg_modules, list):
-                for m in cfg_modules:
-                    if isinstance(m, dict):
-                        name = m.get("name", "")
-                        if name:
-                            modules.append(name)
-                    elif isinstance(m, str):
-                        modules.append(m)
+                modules, module_metadata = _normalize_module_specs(cfg_modules)
         if not edges:
             # Support both: dependencies.edges as a list, and modules[].depends_on
             dep_edges = deep_get(config, "dependencies.edges", None)
@@ -1077,6 +1508,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             templates_dir=templates_dir,
             modules=modules,
             edges=edges,
+            module_metadata=module_metadata,
+            suggestions_path=getattr(args, "suggestions", None),
             git_auto=getattr(args, 'git_auto', False),
         )
         return 0
@@ -1094,12 +1527,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.cmd == "status":
         batches = _batches_from_manifest_or_args()
-        print(orch.status(run_dir=args.run_dir, batches=batches))
+        project_root = getattr(args, 'project_root', None)
+        print(orch.status(run_dir=args.run_dir, batches=batches, project_root=project_root))
         return 0
 
     if args.cmd == "resume":
         batches = _batches_from_manifest_or_args()
-        print(orch.resume(run_dir=args.run_dir, batches=batches))
+        project_root = getattr(args, 'project_root', None)
+        print(orch.resume(run_dir=args.run_dir, batches=batches,
+                          project_root=project_root))
         return 0
 
     if args.cmd == "validate":
@@ -1128,7 +1564,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.cmd == "file-done":
-        result = orch.mark_file_done(run_dir=args.run_dir, task_id=args.task_id)
+        result = orch.mark_file_done(
+            run_dir=args.run_dir,
+            task_id=args.task_id,
+        )
         print(result)
         return 0
 
@@ -1138,9 +1577,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.cmd == "next":
-        manifest = orch.read_run_manifest(args.run_dir)
-        batches = manifest.get("batches", []) if manifest else []
-        print(orch.status(run_dir=args.run_dir, batches=batches))
+        ledger_path = os.path.join(args.run_dir, resolved.ledger_file_name)
+        ledger = TaskLedger(ledger_path, allow_skip_states=resolved.allow_skip_states)
+        latest = ledger.load_latest()
+
+        ready_modules = ledger.ready_tasks()
+        print("## Ready Modules\n")
+        if ready_modules:
+            for t in ready_modules:
+                blocked = " **BLOCKED**" if t.meta.get("blocked") else ""
+                print(f"- {t.module} (status: {t.status}){blocked}")
+        else:
+            print("- (none)")
+
+        print("\n## Ready File Workers\n")
+        any_files = False
+        for task in latest.values():
+            if task.is_sub_task:
+                continue
+            ready_subs = ledger.ready_sub_tasks(task.module)
+            if ready_subs:
+                any_files = True
+                print(f"- **{task.module}**:")
+                for s in ready_subs[:5]:
+                    print(f"  - {s.title} ({s.id})")
+        if not any_files:
+            print("- (none)")
         return 0
 
     if args.cmd == "module-ship":

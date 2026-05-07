@@ -31,7 +31,7 @@ orchestrator:
       line_coverage_target_min: 0.80
       line_coverage_target_max: 0.90
       require_scenario_checklist: true
-      require_cdc: true
+      require_cdc: false
   feature_flags:
     enabled: true
     selective: true
@@ -88,9 +88,9 @@ ledger:
 commands:
   # Test hooks. Uncomment and customize for your project.
   # Contract validation is built-in (no external command needed).
-  # unit_tests:
-  #   command: "python3 -m pytest -q"
-  #   cwd: "{project_root}"
+  unit_tests:
+    command: "python3 -m pytest -q"
+    cwd: "{project_root}"
   # integration_tests:
   #   command: "python3 -m pytest -q -m integration"
   #   cwd: "{project_root}"

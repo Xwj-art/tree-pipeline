@@ -466,6 +466,9 @@ def discover_modules(requirement: str) -> Dict[str, Any]:
         "dependency_candidates": dependency_candidates,
         "shared_hotspots": shared_hotspots,
         "open_questions": open_questions + _default_open_questions(requirement, bundles),
+        "approved": False,
+        "edits": [],
+        "decision_log": [],
     }
 
 
@@ -1033,9 +1036,11 @@ def _module_to_dict(
     return {
         "name": bundle.name,
         "description": bundle.description,
+        "primary_kind": bundle.primary_kind,
         "capabilities": [cap.name for cap in bundle.capabilities],
         "estimated_files": estimated_files,
         "risk_level": risk_level,
+        "owned_paths": [],
         "score": {
             "boundary_clarity": boundary_clarity,
             "estimated_deps": direct_deps,

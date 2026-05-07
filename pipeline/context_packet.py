@@ -39,6 +39,24 @@ def hard_truncate(text: str, max_tokens: int) -> str:
     return text[: max(0, max_chars - 20)].rstrip() + "\n...\n"
 
 
+def section_excerpt(text: str, max_tokens: int) -> str:
+    """Truncate by whole lines first so summaries stay structurally readable."""
+
+    if max_tokens <= 0:
+        return ""
+    lines = [line.rstrip() for line in text.splitlines()]
+    kept: list[str] = []
+    for line in lines:
+        candidate = "\n".join(kept + [line]).strip()
+        if candidate and estimate_tokens(candidate) > max_tokens:
+            break
+        kept.append(line)
+    excerpt = "\n".join(kept).strip()
+    if excerpt:
+        return excerpt
+    return hard_truncate(text, max_tokens)
+
+
 @dataclass(slots=True)
 class ContextPacket:
     """A rendered context packet."""
@@ -68,28 +86,34 @@ class ContextPacketBuilder:
         spec_excerpt: str,
         conventions_excerpt: str,
         lock_excerpt: str = "",
+        state_snapshot: str = "",
+        git_snapshot: str = "",
     ) -> ContextPacket:
         """Build a single markdown context packet."""
 
-        contract_excerpt = hard_truncate(
+        contract_excerpt = section_excerpt(
             contract_excerpt, self.section_budgets.get("contract", 0)
         )
-        spec_excerpt = hard_truncate(spec_excerpt, self.section_budgets.get("spec", 0))
-        conventions_excerpt = hard_truncate(
+        spec_excerpt = section_excerpt(spec_excerpt, self.section_budgets.get("spec", 0))
+        conventions_excerpt = section_excerpt(
             conventions_excerpt, self.section_budgets.get("conventions", 0)
         )
-        lock_excerpt = hard_truncate(lock_excerpt, self.section_budgets.get("lock", 0))
+        lock_excerpt = section_excerpt(lock_excerpt, self.section_budgets.get("lock", 0))
 
         content = (
             f"# Context Packet - {module}\n\n"
             "## Goal\n"
             "Implement this module according to the frozen spec and versioned contract.\n\n"
-            "## Contract (Relevant Excerpt)\n"
+            "## Contract Summary\n"
             f"{contract_excerpt}\n\n"
-            "## Spec (Relevant Excerpt)\n"
+            "## Spec Summary\n"
             f"{spec_excerpt}\n\n"
-            "## Conventions\n"
+            "## Conventions Summary\n"
             f"{conventions_excerpt}\n\n"
+            "## State Snapshot\n"
+            f"{state_snapshot or '- Module state not yet recorded.'}\n\n"
+            "## Git Snapshot\n"
+            f"{git_snapshot or '- Git state not yet recorded.'}\n\n"
             "## Dependency Lock Excerpt (Best-effort)\n"
             f"{lock_excerpt}\n\n"
             "## Execution Checklist (Module Agent)\n"
@@ -111,4 +135,3 @@ class ContextPacketBuilder:
             token_est = estimate_tokens(content)
 
         return ContextPacket(module=module, content=content, token_estimate=token_est)
-

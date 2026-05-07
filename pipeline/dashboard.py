@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from .task_ledger import STATUS_ORDER, TaskEntry, TaskLedger
 
@@ -54,6 +54,7 @@ class DashboardGenerator:
         run_id: str,
         batches: List[List[str]],
         output_path: str,
+        git_status_by_module: Optional[Dict[str, Dict[str, object]]] = None,
     ) -> str:
         """
         Render and write dashboard markdown.
@@ -90,10 +91,22 @@ class DashboardGenerator:
             subs = self.ledger.sub_tasks(task.module)
             sub_done = sum(1 for s in subs if s.status == "done")
             sub_info = f" ({sub_done}/{len(subs)} files)" if subs else ""
+            git_info = (git_status_by_module or {}).get(task.module, {})
+            test_summary = task.meta.get("test_summary", {})
+            branch = str(git_info.get("branch", "-"))
+            pr_url = str(git_info.get("pr_url", "-"))
+            ci_state = str(git_info.get("pr_state", "-"))
+            mergeability = str(git_info.get("mergeable", "-"))
+            test_status = "-"
+            failure_at = "-"
+            if isinstance(test_summary, dict):
+                test_status = str(test_summary.get("status", "-"))
+                failure_at = str(test_summary.get("last_failure_at", "-"))
             rows.append(
-                f"| {task.module}{sub_info} | {task.status} | {deps} | {blocked_str} | {task.updated_at} |"
+                f"| {task.module}{sub_info} | {task.status} | {deps} | {branch} | {pr_url} | "
+                f"{ci_state} | {mergeability} | {test_status} | {failure_at} | {blocked_str} | {task.updated_at} |"
             )
-        task_rows = "\n".join(rows) if rows else "| - | - | - | - | - |"
+        task_rows = "\n".join(rows) if rows else "| - | - | - | - | - | - | - | - | - | - | - |"
 
         # File Worker tables
         sub_sections: List[str] = []
@@ -154,8 +167,8 @@ class DashboardGenerator:
             "## Batches\n\n"
             f"{batches_section}\n\n"
             "## Modules\n\n"
-            "| Module | Status | Depends On | Blocked | Updated |\n"
-            "|---|---|---|---|---|\n"
+            "| Module | Status | Depends On | Branch | PR | CI | Mergeable | Test | Last Failure | Blocked | Updated |\n"
+            "|---|---|---|---|---|---|---|---|---|---|---|\n"
             f"{task_rows}\n\n"
             "## File Workers\n\n"
             f"{file_workers_section}\n\n"
@@ -169,4 +182,3 @@ class DashboardGenerator:
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(md)
         return md
-
