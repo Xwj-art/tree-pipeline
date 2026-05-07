@@ -28,29 +28,40 @@
 
 ## 使用步骤（推荐）
 
-1. 在你的项目工作区准备一个“模块清单 + 依赖边”：
-   - 最简单：在命令行参数里传 `--module` 与 `--edge`
+1. 如果你只有一句需求，先生成模块建议草案：
+   - `python3 -m pipeline.orchestrator suggest-modules --requirement "你的需求描述" --output suggestions.json`
+   - 输出是结构化 JSON，包含：
+     - `capabilities`：从需求里抽出的能力点
+     - `module_candidates`：候选模块（含说明、风险、contract draft、评分）
+     - `dependency_candidates`：建议依赖边（`consumer -> provider`）
+     - `shared_hotspots`：应由 `main` 分支集中管理的共享契约/基础模型/公共库热点
+     - `open_questions`：需要人工确认的问题
+2. 人工审查模块草案，再确认正式模块清单 + 依赖边：
+   - 最简单：把确认后的模块写成 `--module` 与 `--edge`
    - 或者把模块与依赖写进 `pipeline.config.yaml` 并用 `--config` 指定
-2. 启动流水线 + 自动创建模块分支：
+   - 关键原则：
+     - 模块分支只负责各自代码
+     - `contract.yaml`、基础公共模型、共享协议/公共库等共享热点由 `main` 分支集中管理
+3. 启动流水线 + 自动创建模块分支：
    - `python -m pipeline.orchestrator start --project-root <你的项目根目录> --run-dir <本次运行目录> --git-auto`
    - `--git-auto` 会自动为每个模块创建 `module/<name>` 分支并推送到远程
-3. 按 DAG 批次并行执行（Batch1/Batch2...）：
+4. 按 DAG 批次并行执行（Batch1/Batch2...）：
    - 编排器会为每个模块生成 `context_packet.md`（最小上下文包）
    - 模块 Agent 规划文件拆分，创建 plan.json，执行 `dispatch`：
      `python3 -m pipeline.orchestrator dispatch --run-dir <dir> --module <name> --plan plan.json`
    - Worker Agent 各自拿一个文件级 context_packet 并行实现
    - Worker 完成后标记 `done`，模块 Agent 收集结果 + 微批次单测
-4. 模块完成后发布（提交 + 推送 + PR）：
+5. 模块完成后发布（提交 + 推送 + PR）：
    - `python3 -m pipeline.orchestrator module-ship --run-dir <dir> --project-root <repo> --module <name>`
    - 自动 add/commit/push，可选自动创建 PR（取决于 `git.auto_create_pr` 配置）
-5. 完成后运行验证阶段：
+6. 完成后运行验证阶段：
    - `python -m pipeline.orchestrator validate --run-dir <本次运行目录>`
-6. main 守门合并：
+7. main 守门合并：
    - `python -m pipeline.orchestrator gate-merge --run-dir <dir> --project-root <repo> --module <name>`
    - 检查 CI 状态 → squash merge → 删除分支 → 刷新本地 main
-7. 任何时候查看状态：
+8. 任何时候查看状态：
    - `python -m pipeline.orchestrator status --run-dir <本次运行目录>`
-8. 中断后恢复：
+9. 中断后恢复：
    - `python -m pipeline.orchestrator resume --run-dir <本次运行目录>`
 
 ## 依赖工具

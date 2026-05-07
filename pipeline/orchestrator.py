@@ -26,6 +26,7 @@ from .context_packet import ContextPacketBuilder, hard_truncate
 from .dashboard import DashboardGenerator
 from .git_manager import GitManager
 from .graph import GraphBatches, build_topological_batches, edges_from_strings
+from .module_discovery import discover_modules
 from .runners.test_runner import TestRunner
 from .task_ledger import TaskEntry, TaskLedger
 from .validators.contract_validate import ContractValidationError, load_contract, validate_contract
@@ -947,6 +948,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Automatically create and push module/<name> branches for each module",
     )
 
+    p_suggest = sub.add_parser(
+        "suggest-modules",
+        help="Suggest module candidates, contracts, and dependency edges from a requirement",
+    )
+    p_suggest.add_argument(
+        "--requirement",
+        required=True,
+        help="Natural-language requirement text for any software domain",
+    )
+    p_suggest.add_argument(
+        "--output",
+        required=True,
+        help="Path to write structured module suggestions JSON",
+    )
+
     p_status = sub.add_parser("status", help="Render dashboard for an existing run")
     p_status.add_argument("--run-dir", required=True)
     p_status.add_argument("--module", action="append", default=[], help="Optional: override manifest")
@@ -1004,6 +1020,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     config = load_yaml_or_json(config_path)
     resolved = resolve_config(config)
     orch = Orchestrator(config=resolved)
+
+    if args.cmd == "suggest-modules":
+        suggestions = discover_modules(args.requirement)
+        write_text(args.output, json.dumps(suggestions, indent=2, ensure_ascii=False) + "\n")
+        print(f"Module suggestions written to {args.output}")
+        return 0
 
     if args.cmd == "start":
         modules = _parse_modules(args.module)
@@ -1150,4 +1172,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
-
