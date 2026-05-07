@@ -24,9 +24,10 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .context_packet import ContextPacketBuilder, hard_truncate
 from .dashboard import DashboardGenerator
+from .git_manager import GitManager
 from .graph import GraphBatches, build_topological_batches, edges_from_strings
 from .runners.test_runner import TestRunner
-from .task_ledger import TaskLedger
+from .task_ledger import TaskEntry, TaskLedger
 from .validators.contract_validate import ContractValidationError, load_contract, validate_contract
 
 
@@ -92,6 +93,17 @@ def deep_get(config: Dict[str, Any], path: str, default: Any) -> Any:
 
 
 @dataclass(slots=True)
+class GitConfig:
+    """Resolved git automation config."""
+
+    auto_create_pr: bool
+    merge_strategy: str  # "squash" | "merge" | "rebase"
+    auto_delete_branch: bool
+    require_ci_pass: bool
+    base_branch: str
+
+
+@dataclass(slots=True)
 class OrchestratorConfig:
     """Resolved orchestrator config used by the runtime."""
 
@@ -112,6 +124,7 @@ class OrchestratorConfig:
     require_signatures: bool
 
     commands: Dict[str, Dict[str, str]]
+    git: GitConfig
 
 
 def resolve_config(config: Dict[str, Any]) -> OrchestratorConfig:
@@ -146,6 +159,13 @@ def resolve_config(config: Dict[str, Any]) -> OrchestratorConfig:
             deep_get(config, "contract.compatibility.require_signatures", True)
         ),
         commands=dict(deep_get(config, "commands", {}) or {}),
+        git=GitConfig(
+            auto_create_pr=bool(deep_get(config, "git.auto_create_pr", False)),
+            merge_strategy=str(deep_get(config, "git.merge_strategy", "squash")),
+            auto_delete_branch=bool(deep_get(config, "git.auto_delete_branch", True)),
+            require_ci_pass=bool(deep_get(config, "git.require_ci_pass", True)),
+            base_branch=str(deep_get(config, "git.base_branch", "main")),
+        ),
     )
 
 
@@ -168,6 +188,7 @@ class Orchestrator:
         templates_dir: str,
         modules: Sequence[str],
         edges: Sequence[Tuple[str, str]],
+        git_auto: bool = False,
     ) -> None:
         """Initialize a new pipeline run directory with specs, ledger, and packets."""
 
@@ -213,6 +234,9 @@ class Orchestrator:
         DashboardGenerator(ledger).render(
             run_id=run_id, batches=batches.batches, output_path=dash_path
         )
+
+        if git_auto:
+            self._ensure_module_branches(project_root=project_root, modules=list(modules))
 
     def resume(self, *, run_dir: str, batches: List[List[str]]) -> str:
         """Resume a run: auto-unblock stale blocks, then refresh the dashboard.
@@ -535,6 +559,165 @@ class Orchestrator:
             modules.add(m.group(1))
         return modules
 
+    # ── Git automation ─────────────────────────────────────────────────
+
+    def _git(self, project_root: str) -> GitManager:
+        return GitManager(
+            repo_root=project_root,
+            base_branch=self.config.git.base_branch,
+        )
+
+    def _ensure_module_branches(self, *, project_root: str, modules: list[str]) -> None:
+        """Create module/<name> branches for all modules."""
+        git = self._git(project_root)
+
+        avail = git.ensure_cli_available()
+        if not avail.ok:
+            raise RuntimeError(avail.message)
+
+        auth = git.ensure_gh_auth()
+        if not auth.ok:
+            raise RuntimeError(auth.message)
+
+        print(f"[git-auto] Creating branches for {len(modules)} modules on base '{self.config.git.base_branch}'")
+        for m in modules:
+            branch = f"module/{m}"
+            result = git.ensure_module_branch(module=m, branch=branch)
+            if not result.ok:
+                raise RuntimeError(f"Failed to create branch for {m}: {result.errors}")
+            print(f"  {m}: {branch} {'(reused)' if not result.changed else '(created)'}")
+
+    def gate_merge(self, *, run_dir: str, project_root: str, module: str) -> str:
+        """Merge a module PR into base branch through the main gate.
+
+        Checks CI pass status before merging.
+        """
+        git = self._git(project_root)
+        branch = f"module/{module}"
+
+        avail = git.ensure_cli_available()
+        if not avail.ok:
+            return f"ERROR: {avail.message}"
+
+        auth = git.ensure_gh_auth()
+        if not auth.ok:
+            return f"ERROR: {auth.message}"
+
+        # Ensure we're on base branch
+        base_result = git.checkout_base_and_pull()
+        if not base_result.ok:
+            return f"ERROR: {base_result.errors}"
+
+        # Check merge conflicts
+        conflict = git.check_merge_conflicts(branch=branch)
+        if not conflict.ok:
+            return f"ERROR: Merge blocked — {conflict.errors}\n{conflict.message}"
+
+        # Merge
+        result = git.merge_pr(
+            pr=branch,
+            merge_strategy=self.config.git.merge_strategy,
+            delete_branch=self.config.git.auto_delete_branch,
+            require_ci_pass=self.config.git.require_ci_pass,
+        )
+        if not result.ok:
+            return f"ERROR: Merge failed: {result.errors}"
+
+        # Update dashboard
+        ledger_path = os.path.join(run_dir, self.config.ledger_file_name)
+        ledger = TaskLedger(ledger_path, allow_skip_states=True)
+        dash_path = os.path.join(run_dir, self.config.dashboard_file_name)
+        DashboardGenerator(ledger).render(
+            run_id=os.path.basename(os.path.abspath(run_dir)),
+            batches=[],
+            output_path=dash_path,
+        )
+
+        return result.message
+
+    @staticmethod
+    def _pr_body(*, ledger: TaskLedger, module: str, run_dir: str) -> str:
+        """Generate a PR body from module state."""
+        subs = ledger.sub_tasks(module)
+        done = sum(1 for s in subs if s.status == "done")
+        return (
+            f"## Module: {module}\n\n"
+            f"- Run dir: `{run_dir}`\n"
+            f"- Files: {done}/{len(subs)} done\n"
+            f"- Status: ready for review\n"
+        )
+
+    def _write_git_meta(self, *, ledger: TaskLedger, module: str, branch: str) -> None:
+        """Write git metadata into the module task entry."""
+        latest = ledger.load_latest()
+        task = latest.get(module)
+        if task is None:
+            return
+        import json
+        updated = TaskEntry(
+            id=task.id, module=task.module, title=task.title,
+            status=task.status, depends_on=task.depends_on,
+            created_at=task.created_at, updated_at=task.updated_at,
+            meta={
+                **task.meta,
+                "git": json.dumps({"branch": branch, "shipped": True}),
+            },
+            parent_id=task.parent_id,
+        )
+        ledger.append(updated)
+
+    def module_ship(self, *, run_dir: str, project_root: str, module: str,
+                    commit_message: str = "", pr_title: str = "",
+                    pr_body: str = "") -> str:
+        """Internal: ship a module using subprocess for git switch."""
+        import subprocess
+
+        ledger_path = os.path.join(run_dir, self.config.ledger_file_name)
+        ledger = TaskLedger(ledger_path, allow_skip_states=True)
+
+        if not ledger.all_sub_tasks_done(module):
+            subs = ledger.sub_tasks(module)
+            pending = [s.id for s in subs if s.status != "done"]
+            return f"ERROR: Cannot ship {module} — {len(pending)} file(s) not done: {', '.join(pending[:10])}"
+
+        git = self._git(project_root)
+        branch = f"module/{module}"
+
+        avail = git.ensure_cli_available()
+        if not avail.ok:
+            return f"ERROR: {avail.message}"
+
+        auth = git.ensure_gh_auth()
+        if not auth.ok:
+            return f"ERROR: {auth.message}"
+
+        info = git.branch_info(branch)
+        if not info.exists_local:
+            return f"ERROR: Branch {branch} does not exist. Run 'start --git-auto' first."
+
+        if not info.current:
+            subprocess.run(["git", "switch", branch], cwd=project_root, capture_output=True, text=True)
+
+        msg = commit_message or f"feat({module}): implement {module} module"
+        commit = git.commit_paths(message=msg)
+        print(f"[module-ship] Commit: {commit.message}")
+
+        push = git.push_branch(branch=branch)
+        if not push.ok:
+            return f"ERROR: Push failed: {push.errors}"
+        print(f"[module-ship] Push: {push.message}")
+
+        if self.config.git.auto_create_pr:
+            title = pr_title or f"[module:{module}] {module} implementation"
+            body = pr_body or self._pr_body(ledger=ledger, module=module, run_dir=run_dir)
+            pr = git.ensure_pr(branch=branch, title=title, body=body)
+            if not pr.ok:
+                return f"ERROR: PR failed: {pr.errors}"
+            print(f"[module-ship] PR: {pr.message}")
+
+        self._write_git_meta(ledger=ledger, module=module, branch=branch)
+        return f"Module {module} shipped: branch={branch}, pushed={push.changed}"
+
     def _write_spec_and_conventions(
         self,
         *,
@@ -759,6 +942,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--edge", action="append", default=[],
         help="Dependency edge: DEPENDENT:DEPENDENCY (e.g. room-system:core-engine means room-system depends on core-engine)",
     )
+    p_start.add_argument(
+        "--git-auto", action="store_true", default=False,
+        help="Automatically create and push module/<name> branches for each module",
+    )
 
     p_status = sub.add_parser("status", help="Render dashboard for an existing run")
     p_status.add_argument("--run-dir", required=True)
@@ -787,6 +974,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_file_done = sub.add_parser("file-done", help="Mark a file sub-task as done + auto-advance")
     p_file_done.add_argument("--run-dir", required=True)
     p_file_done.add_argument("--task-id", required=True, help="Sub-task id (e.g. api::src/models.py)")
+
+    p_module_ship = sub.add_parser("module-ship", help="Ship a module: commit, push, and create PR")
+    p_module_ship.add_argument("--run-dir", required=True)
+    p_module_ship.add_argument("--project-root", required=True)
+    p_module_ship.add_argument("--module", required=True)
+    p_module_ship.add_argument("--commit-message", default="")
+    p_module_ship.add_argument("--pr-title", default="")
+    p_module_ship.add_argument("--pr-body-file", default=None, help="PR body template file")
+
+    p_gate_merge = sub.add_parser("gate-merge", help="Merge a module PR through the main gate")
+    p_gate_merge.add_argument("--run-dir", required=True)
+    p_gate_merge.add_argument("--project-root", required=True)
+    p_gate_merge.add_argument("--module", required=True)
+    p_gate_merge.add_argument("--pr", default=None, help="PR number (alternative to --module)")
 
     p_module_check = sub.add_parser("module-check", help="Show per-status file counts for a module")
     p_module_check.add_argument("--run-dir", required=True)
@@ -854,6 +1055,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             templates_dir=templates_dir,
             modules=modules,
             edges=edges,
+            git_auto=getattr(args, 'git_auto', False),
         )
         return 0
 
@@ -918,6 +1120,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         batches = manifest.get("batches", []) if manifest else []
         print(orch.status(run_dir=args.run_dir, batches=batches))
         return 0
+
+    if args.cmd == "module-ship":
+        pr_body = ""
+        if getattr(args, 'pr_body_file', None):
+            pr_body = read_text(args.pr_body_file)
+        result = orch.module_ship(
+            run_dir=args.run_dir,
+            project_root=args.project_root,
+            module=args.module,
+            commit_message=getattr(args, 'commit_message', ""),
+            pr_title=getattr(args, 'pr_title', ""),
+            pr_body=pr_body,
+        )
+        print(result)
+        return 0 if not result.startswith("ERROR") else 1
+
+    if args.cmd == "gate-merge":
+        result = orch.gate_merge(
+            run_dir=args.run_dir,
+            project_root=args.project_root,
+            module=args.module,
+        )
+        print(result)
+        return 0 if not result.startswith("ERROR") else 1
 
     raise AssertionError(f"Unhandled command: {args.cmd}")
 

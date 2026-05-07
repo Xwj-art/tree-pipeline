@@ -31,19 +31,26 @@
 1. 在你的项目工作区准备一个“模块清单 + 依赖边”：
    - 最简单：在命令行参数里传 `--module` 与 `--edge`
    - 或者把模块与依赖写进 `pipeline.config.yaml` 并用 `--config` 指定
-2. 启动流水线（生成 `contract.yaml`/`spec.md`/`tasks.jsonl`/`dashboard.md`）：
-   - `python -m pipeline.orchestrator start --project-root <你的项目根目录> --run-dir <本次运行目录>`
+2. 启动流水线 + 自动创建模块分支：
+   - `python -m pipeline.orchestrator start --project-root <你的项目根目录> --run-dir <本次运行目录> --git-auto`
+   - `--git-auto` 会自动为每个模块创建 `module/<name>` 分支并推送到远程
 3. 按 DAG 批次并行执行（Batch1/Batch2...）：
    - 编排器会为每个模块生成 `context_packet.md`（最小上下文包）
    - 模块 Agent 规划文件拆分，创建 plan.json，执行 `dispatch`：
      `python3 -m pipeline.orchestrator dispatch --run-dir <dir> --module <name> --plan plan.json`
    - Worker Agent 各自拿一个文件级 context_packet 并行实现
    - Worker 完成后标记 `done`，模块 Agent 收集结果 + 微批次单测
-4. 完成后运行验证阶段：
+4. 模块完成后发布（提交 + 推送 + PR）：
+   - `python3 -m pipeline.orchestrator module-ship --run-dir <dir> --project-root <repo> --module <name>`
+   - 自动 add/commit/push，可选自动创建 PR（取决于 `git.auto_create_pr` 配置）
+5. 完成后运行验证阶段：
    - `python -m pipeline.orchestrator validate --run-dir <本次运行目录>`
-5. 任何时候查看状态：
+6. main 守门合并：
+   - `python -m pipeline.orchestrator gate-merge --run-dir <dir> --project-root <repo> --module <name>`
+   - 检查 CI 状态 → squash merge → 删除分支 → 刷新本地 main
+7. 任何时候查看状态：
    - `python -m pipeline.orchestrator status --run-dir <本次运行目录>`
-6. 中断后恢复：
+8. 中断后恢复：
    - `python -m pipeline.orchestrator resume --run-dir <本次运行目录>`
 
 ## 依赖工具
@@ -63,7 +70,8 @@ tree-pipeline 是**多模块并行开发的总统筹层**，不是单模块实�
 | JSONL 任务账本（含子任务） + 状态机        | 模块/文件代码实现 | 模块 Agent / Worker Agent   |
 | Context Packet 构建与分发（模块+文件级）   | 代码审查          | `code-reviewer` agent       |
 | `dispatch` 文件级任务分发 + 内部 DAG       | TDD 测试编写      | `tdd-guide` agent           |
-| 契约校验（签名 + semver）                  | Git 提交/PR 流程  | `prp-commit` / git-workflow |
+| 契约校验（签名 + semver）                  | 代码实现          | Module Agent / Worker Agent |
+| Git 分支/提交/PR/合并自动化                | -                 | 内置 `GitManager`           |
 | dashboard.md 看板汇总（模块+File Workers） | CI/CD 部署        | 项目自身 CI 系统            |
 | 中断恢复（resume）                         | Mutation Testing  | 夜间 CI（仅预留钩子）       |
 

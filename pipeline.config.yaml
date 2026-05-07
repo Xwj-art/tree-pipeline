@@ -98,6 +98,13 @@ commands:
   #   command: "python3 -m pytest -q -m cdc"
   #   cwd: "{project_root}"
 
+git:
+  auto_create_pr: false
+  merge_strategy: squash
+  auto_delete_branch: true
+  require_ci_pass: true
+  base_branch: main
+
 logging:
   level: INFO
   json: false
